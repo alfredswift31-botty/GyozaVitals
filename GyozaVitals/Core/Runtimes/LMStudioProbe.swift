@@ -38,7 +38,7 @@ nonisolated enum LMStudioProbe {
         let models = listed.filter(\.isResident).map { entry -> LoadedModel in
             let file = match(entry.id, among: files)
             let role: ModelRole
-            switch entry.type {
+            switch entry.type ?? "" {
             case "embeddings", "embedding": role = .embedding
             case "vlm": role = .vision
             case "llm": role = .text

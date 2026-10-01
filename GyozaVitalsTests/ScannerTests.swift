@@ -236,7 +236,7 @@ struct ProcessClassifierTests {
          Classification(.lmStudio)),
     ]
 
-    @Test(arguments: runtimeCases) func classifiesRuntimes(record: ProcessRecord, expected: Classification) {
+    @Test(arguments: ProcessClassifierTests.runtimeCases) func classifiesRuntimes(record: ProcessRecord, expected: Classification) {
         #expect(ProcessClassifier.classify(record, parent: nil) == expected)
     }
 
@@ -248,7 +248,7 @@ struct ProcessClassifierTests {
         record("sd", path: "/usr/local/bin/sd", ["sd", "--help"]),
     ]
 
-    @Test(arguments: otherCases) func ignoresOtherProcesses(record: ProcessRecord) {
+    @Test(arguments: ProcessClassifierTests.otherCases) func ignoresOtherProcesses(record: ProcessRecord) {
         #expect(ProcessClassifier.classify(record, parent: nil) == nil)
     }
 
@@ -282,7 +282,7 @@ struct ModelRoleTests {
         ("flux1-dev.safetensors", .sdcpp, .image),
     ]
 
-    @Test(arguments: roleCases) func guessesRoles(fileName: String, runtime: RuntimeKind, expected: ModelRole) {
+    @Test(arguments: ModelRoleTests.roleCases) func guessesRoles(fileName: String, runtime: RuntimeKind, expected: ModelRole) {
         #expect(ModelRoles.guess(fileName: fileName, runtime: runtime) == expected)
     }
 
