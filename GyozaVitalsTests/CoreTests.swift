@@ -23,6 +23,7 @@ struct FormattingTests {
     }
 }
 
+@MainActor
 struct MemorySnapshotTests {
     @Test func headroomOnlyWhilePressureIsNormal() {
         var memory = Fixtures.quietSystem.memory
