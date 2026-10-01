@@ -88,20 +88,15 @@ nonisolated enum KoboldProbe {
         return ProbeResult(version: version?.version, isBusy: isBusy, models: models)
     }
 
-    /// The first bare argument that names a weights file.
+    /// The first bare argument that names a weights file and isn't the value
+    /// of a flag ("--model x.gguf" is handled by the flag; "--usecpu x.gguf"
+    /// is missed here but the mapped file still shows up).
     static func positionalModel(_ arguments: [String]) -> String? {
-        var index = 1
-        while index < arguments.count {
+        for index in 1..<max(1, arguments.count) {
             let argument = arguments[index]
-            if argument.hasPrefix("-") {
-                index += 1
-                continue
-            }
-            if argument.hasSuffix("koboldcpp.py") {
-                index += 1
-                continue
-            }
-            return ModelFiles.isModelPath(argument) ? argument : nil
+            guard !argument.hasPrefix("-"), !argument.hasSuffix("koboldcpp.py"), ModelFiles.isModelPath(argument) else { continue }
+            if arguments[index - 1].hasPrefix("-") { continue }
+            return argument
         }
         return nil
     }

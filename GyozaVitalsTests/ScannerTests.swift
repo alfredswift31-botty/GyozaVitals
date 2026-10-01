@@ -110,6 +110,8 @@ struct KoboldParserTests {
         #expect(KoboldProbe.positionalModel(["koboldcpp", "--port", "5001", "models/x.gguf"]) == "models/x.gguf")
         #expect(KoboldProbe.positionalModel(["python3", "koboldcpp.py", "x.gguf"]) == "x.gguf")
         #expect(KoboldProbe.positionalModel(["koboldcpp", "--model", "x.gguf"]) == nil)
+        #expect(KoboldProbe.positionalModel(["koboldcpp", "x.gguf", "--port", "5001"]) == "x.gguf")
+        #expect(KoboldProbe.positionalModel(["koboldcpp", "--usecpu"]) == nil)
     }
 }
 
@@ -345,7 +347,8 @@ struct RealProcessTests {
         defer { munmap(mapping, length) }
         #expect(mapping.load(as: UInt8.self) == 0x47)
 
-        let expected = url.resolvingSymlinksInPath().path
+        let expected = ModelFiles.resolve(url.path, cwd: nil)
+        #expect(expected.hasSuffix("/fixture-7b-Q4_K_M.gguf"))
         let mapped = ProcessFiles.mappedFiles(pid: getpid())
         #expect(mapped.contains(expected), "mapped files were: \(mapped.filter { $0.hasSuffix(".gguf") })")
         let files = ModelFiles.files(amongPaths: mapped, minimumBytes: UInt64(length))
@@ -360,7 +363,7 @@ struct RealProcessTests {
         let fd = open(url.path, O_RDONLY)
         try #require(fd >= 0)
         defer { close(fd) }
-        let expected = url.resolvingSymlinksInPath().path
+        let expected = ModelFiles.resolve(url.path, cwd: nil)
         #expect(ProcessFiles.openFiles(pid: getpid()).contains(expected))
     }
 

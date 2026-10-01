@@ -47,7 +47,12 @@ nonisolated enum ModelFiles {
                 full = (cwd as NSString).appendingPathComponent(path)
             }
         }
-        return URL(fileURLWithPath: full).standardizedFileURL.resolvingSymlinksInPath().path
+        let standardized = URL(fileURLWithPath: full).standardizedFileURL.path
+        // realpath keeps "/private/var" as the kernel reports it; URL's
+        // resolvingSymlinksInPath would strip the "/private" and never match.
+        guard let real = realpath(standardized, nil) else { return standardized }
+        defer { free(real) }
+        return String(cString: real)
     }
 
     /// Model files among a process's mapped and open paths.
