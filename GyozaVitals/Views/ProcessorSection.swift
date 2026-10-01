@@ -22,7 +22,7 @@ struct ProcessorSection: View {
                 HStack(spacing: 0) {
                     if let gpu {
                         column("GPU", gpu.utilization.map(Formatting.percent))
-                        column("GPU memory", gpu.inUseBytes.map(Formatting.bytes))
+                        column("GPU memory", gpu.inUseBytes.map(Formatting.bytes), span: 2)
                     }
                     column("Thermal", thermal?.rawValue, tint: thermalTint)
                 }
@@ -31,9 +31,10 @@ struct ProcessorSection: View {
         }
     }
 
-    private func column(_ label: String, _ value: String?, tint: Color? = nil) -> some View {
+    /// One label-over-value column; `span` takes more of the four when the label needs it.
+    private func column(_ label: String, _ value: String?, tint: Color? = nil, span: Int = 1) -> some View {
         MetaPair(label: label, value: value ?? Self.dash, monospaced: true, tint: value == nil ? nil : tint)
-            .frame(width: Theme.Layout.column, alignment: .leading)
+            .frame(width: Theme.Layout.column * CGFloat(span), alignment: .leading)
     }
 
     private var thermalTint: Color? {

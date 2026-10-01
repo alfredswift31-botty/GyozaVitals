@@ -26,7 +26,7 @@ struct VitalsPopover: View {
                 ActivitySection(events: store.events)
             }
             .padding(.horizontal, Theme.Space.l)
-            .padding(.top, Theme.Space.m)
+            .padding(.top, Theme.Space.l)
             .padding(.bottom, Theme.Space.l)
             PopoverFooter()
         }

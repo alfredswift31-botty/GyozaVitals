@@ -119,11 +119,11 @@ enum Theme {
     enum Layout {
         static let popoverWidth: CGFloat = 340
         static let settingsWidth: CGFloat = 520
-        static let settingsHeight: CGFloat = 620
+        static let settingsHeight: CGFloat = 700
         /// Label-over-value column: four to a row.
         static let column: CGFloat = 77
         /// The memory legend's five columns, summing to the 308 pt content column.
-        static let legendColumns: [CGFloat] = [60, 56, 56, 84, 52]
+        static let legendColumns: [CGFloat] = [56, 56, 52, 96, 48]
         static let labelRow: CGFloat = 20
         static let textRow: CGFloat = 16
         static let modelRow: CGFloat = 44

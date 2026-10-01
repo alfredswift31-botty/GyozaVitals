@@ -61,8 +61,9 @@ struct StatusItemLabel: View {
     }()
 }
 
-/// A little gyoza: a rounded half-moon, three pleat ticks on its arc, over a
-/// short baseline. Designed on an 18 pt grid, 1.5 pt stroke, round caps.
+/// A little gyoza: a plump half-moon with rounded corners, three short
+/// pleat marks crimped along its arc, resting on a short plate. Designed on
+/// an 18 pt grid, 1.5 pt stroke, round caps and joins.
 nonisolated struct GyozaGlyph: Shape {
     /// The design grid the measurements below are in (18 pt).
     let grid: CGFloat
@@ -71,32 +72,40 @@ nonisolated struct GyozaGlyph: Shape {
 
     func path(in rect: CGRect) -> Path {
         let unit = min(rect.width, rect.height) / grid
-        let center = CGPoint(x: rect.midX, y: rect.minY + 11.25 * unit)
-        let radius = 6.5 * unit
+        let center = CGPoint(x: rect.midX, y: rect.minY + 11 * unit)
+        let radius = 7 * unit
+        let corner = 2.25 * unit
+        let plateY = rect.minY + 15.25 * unit
 
-        // The half-moon, as a polyline through the arc so the direction is unambiguous.
-        var body = Path()
-        let steps = 36
-        for step in 0...steps {
-            let angle = Double.pi + Double.pi * Double(step) / Double(steps)
-            let point = CGPoint(x: center.x + radius * CGFloat(cos(angle)), y: center.y + radius * CGFloat(sin(angle)))
-            if step == 0 { body.move(to: point) } else { body.addLine(to: point) }
+        func onArc(_ degrees: Double, _ r: CGFloat) -> CGPoint {
+            let angle = degrees * .pi / 180
+            return CGPoint(x: center.x + r * CGFloat(cos(angle)), y: center.y + r * CGFloat(sin(angle)))
         }
+
+        // The body: along the flat bottom, round the right corner, over the
+        // top from right to left, round the left corner, close.
+        var body = Path()
+        body.move(to: CGPoint(x: center.x, y: center.y))
+        body.addArc(tangent1End: CGPoint(x: center.x + radius, y: center.y),
+                    tangent2End: CGPoint(x: center.x + radius, y: center.y - corner), radius: corner)
+        let steps = 40
+        let from = -18.0, to = -162.0
+        for step in 0...steps {
+            body.addLine(to: onArc(from + (to - from) * Double(step) / Double(steps), radius))
+        }
+        body.addArc(tangent1End: CGPoint(x: center.x - radius, y: center.y),
+                    tangent2End: CGPoint(x: center.x, y: center.y), radius: corner)
         body.closeSubpath()
         // The plate.
-        body.move(to: CGPoint(x: center.x - 4 * unit, y: rect.minY + 15.5 * unit))
-        body.addLine(to: CGPoint(x: center.x + 4 * unit, y: rect.minY + 15.5 * unit))
+        body.move(to: CGPoint(x: center.x - 4.5 * unit, y: plateY))
+        body.addLine(to: CGPoint(x: center.x + 4.5 * unit, y: plateY))
         var result = body.strokedPath(StrokeStyle(lineWidth: stroke * unit, lineCap: .round, lineJoin: .round))
 
-        // Three pleats crossing the arc.
+        // Three pleats, crimped mostly inward so they read as folds, not spikes.
         var pleats = Path()
-        for degrees in [-125.0, -90, -55] {
-            let angle = degrees * .pi / 180
-            let direction = CGPoint(x: CGFloat(cos(angle)), y: CGFloat(sin(angle)))
-            let inner = CGPoint(x: center.x + direction.x * (radius - 1.5 * unit), y: center.y + direction.y * (radius - 1.5 * unit))
-            let outer = CGPoint(x: center.x + direction.x * (radius + 1.25 * unit), y: center.y + direction.y * (radius + 1.25 * unit))
-            pleats.move(to: inner)
-            pleats.addLine(to: outer)
+        for degrees in [-122.0, -90, -58] {
+            pleats.move(to: onArc(degrees, radius - 2.5 * unit))
+            pleats.addLine(to: onArc(degrees, radius + 0.25 * unit))
         }
         result.addPath(pleats.strokedPath(StrokeStyle(lineWidth: pleat * unit, lineCap: .round)))
         return result

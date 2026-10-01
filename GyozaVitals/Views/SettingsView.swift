@@ -92,6 +92,7 @@ private struct RuntimeRow: View {
             Toggle(kind.displayName, isOn: $watched)
             if kind.defaultPort != nil {
                 TextField("Port", value: $port, format: IntegerFormatStyle<Int>().grouping(.never))
+                    .labelsHidden()
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
                     .font(Theme.Typeface.mono)

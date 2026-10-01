@@ -24,14 +24,14 @@ struct UISnapshotTests {
     func popoverBusy(dark: Bool) throws {
         let store = Fixtures.busyStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.busyPressure),
-                            name: "01-popover-busy", size: CGSize(width: Self.width, height: 800), dark: dark)
+                            name: "01-popover-busy", size: CGSize(width: Self.width, height: 804), dark: dark)
     }
 
     @Test(arguments: [false, true])
     func popoverQuiet(dark: Bool) throws {
         let store = Fixtures.quietStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.quietPressure),
-                            name: "02-popover-quiet", size: CGSize(width: Self.width, height: 620), dark: dark)
+                            name: "02-popover-quiet", size: CGSize(width: Self.width, height: 624), dark: dark)
     }
 
     @Test(arguments: [false, true])
@@ -54,10 +54,10 @@ struct UISnapshotTests {
     func popoverSingle(dark: Bool) throws {
         let store = Fixtures.singleStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.quietPressure),
-                            name: "05-popover-single", size: CGSize(width: Self.width, height: 620), dark: dark)
+                            name: "05-popover-single", size: CGSize(width: Self.width, height: 628), dark: dark)
     }
 
-    /// The status item in its three settings, on the window background the bar would give it.
+    /// The status item in its three settings at 3x, and the glyph alone at 8x.
     @Test(arguments: [false, true])
     func statusItem(dark: Bool) throws {
         let row = HStack(spacing: Theme.Space.xl) {
@@ -66,8 +66,15 @@ struct UISnapshotTests {
             StatusItemLabel(modelBytes: 27_400_000_000, modelCount: 5, content: .modelMemory)
             StatusItemLabel(modelBytes: 1_300_000_000, modelCount: 1, content: .modelMemory)
         }
-        .padding(Theme.Space.s)
-        .scaleEffect(3, anchor: .topLeading)
-        try Snapshot.render(row, name: "06-status-item", size: CGSize(width: 720, height: 110), dark: dark)
+        let sheet = VStack(alignment: .leading, spacing: Theme.Space.xxl) {
+            row.scaleEffect(3, anchor: .topLeading)
+                .frame(height: Theme.StatusItem.glyphSize * 3, alignment: .topLeading)
+            Image(nsImage: StatusItemLabel.glyph)
+                .resizable()
+                .frame(width: Theme.StatusItem.glyphSize * 8, height: Theme.StatusItem.glyphSize * 8)
+        }
+        .padding(Theme.Space.l)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        try Snapshot.render(sheet, name: "06-status-item", size: CGSize(width: 760, height: 260), dark: dark)
     }
 }
