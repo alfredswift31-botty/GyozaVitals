@@ -55,7 +55,7 @@ struct MemorySection: View {
             MetaPair(label: "Compressed", value: value(\.compressedBytes), monospaced: true)
                 .frame(width: widths[3], alignment: .leading)
             MetaPair(label: "Swap", value: value(\.swapUsedBytes), monospaced: true)
-                .frame(width: widths[4], alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .accessibilityAddTraits(.updatesFrequently)
     }

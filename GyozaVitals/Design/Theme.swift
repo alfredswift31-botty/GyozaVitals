@@ -122,8 +122,9 @@ enum Theme {
         static let settingsHeight: CGFloat = 700
         /// Label-over-value column: four to a row.
         static let column: CGFloat = 77
-        /// The memory legend's five columns, summing to the 308 pt content column.
-        static let legendColumns: [CGFloat] = [60, 56, 52, 92, 48]
+        /// The memory legend's first four columns; SWAP takes the rest of the
+        /// 308 pt content column, right-aligned, at least 12 pt clear of COMPRESSED.
+        static let legendColumns: [CGFloat] = [60, 56, 52, 90]
         static let labelRow: CGFloat = 20
         static let textRow: CGFloat = 16
         static let modelRow: CGFloat = 44
