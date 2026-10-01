@@ -18,11 +18,13 @@ struct GyozaVitalsApp: App {
             VitalsPopover()
                 .environmentObject(store)
                 .environmentObject(settings)
-                .onAppear { store.isPopoverOpen = true; if store.lastScan == nil { store.start() } }
+                .onAppear { store.isPopoverOpen = true }
                 .onDisappear { store.isPopoverOpen = false }
         } label: {
             StatusItemLabel(modelBytes: store.modelBytes, modelCount: store.models.count,
                             content: settings.statusItemContent)
+                // The label exists from launch, so monitoring starts here, not on the first click.
+                .onAppear { store.start() }
         }
         .menuBarExtraStyle(.window)
 

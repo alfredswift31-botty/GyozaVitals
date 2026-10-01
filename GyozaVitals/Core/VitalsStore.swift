@@ -51,7 +51,12 @@ final class VitalsStore: ObservableObject {
 
     // MARK: Schedule
 
+    private var started = false
+
+    /// Begins the refresh schedule. Calling it again is a no-op.
     func start() {
+        guard !started else { return }
+        started = true
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.sleeping = true; self?.reschedule() }
@@ -69,6 +74,7 @@ final class VitalsStore: ObservableObject {
         let center = NSWorkspace.shared.notificationCenter
         observers.forEach { center.removeObserver($0) }
         observers.removeAll()
+        started = false
     }
 
     private func reschedule() {
