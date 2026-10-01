@@ -32,7 +32,7 @@ nonisolated enum ModelFiles {
     /// Size on disk; nil when the path can't be stat'ed.
     static func size(ofFile path: String) -> UInt64? {
         var status = stat()
-        guard stat(path, &status) == 0, (Int32(status.st_mode) & S_IFMT) == S_IFREG else { return nil }
+        guard stat(path, &status) == 0, (status.st_mode & S_IFMT) == S_IFREG else { return nil }
         return UInt64(max(0, status.st_size))
     }
 

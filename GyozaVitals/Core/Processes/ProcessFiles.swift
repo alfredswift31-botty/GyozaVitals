@@ -114,8 +114,8 @@ nonisolated enum ProcessFiles {
 
     /// The process's current working directory, to resolve relative paths in its argv.
     static func currentDirectory(pid: pid_t) -> String? {
-        var info = vnode_pathinfo()
-        let size = Int32(MemoryLayout<vnode_pathinfo>.size)
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
         let got = withUnsafeMutablePointer(to: &info) { proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, $0, size) }
         guard got == size else { return nil }
         let path = CStrings.string(info.pvi_cdir.vip_path)
