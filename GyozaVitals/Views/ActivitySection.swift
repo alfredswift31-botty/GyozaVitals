@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// ACTIVITY: the last five events, time then text. The block keeps the
-/// height of five rows whether it holds none or five.
+/// ACTIVITY: the last five events, time then text. The block is as tall as
+/// the rows it shows (one for the empty line), so it changes only when the
+/// event count does, never on a tick.
 struct ActivitySection: View {
     let events: [ActivityEvent]
 
@@ -14,8 +15,9 @@ struct ActivitySection: View {
         return Formatting.clock(late)
     }()
 
-    private static var blockHeight: CGFloat {
-        CGFloat(Theme.Layout.activityRows) * Theme.Layout.textRow + CGFloat(Theme.Layout.activityRows - 1) * Theme.Space.xs
+    private var blockHeight: CGFloat {
+        let rows = max(1, min(recent.count, Theme.Layout.activityRows))
+        return CGFloat(rows) * Theme.Layout.textRow + CGFloat(rows - 1) * Theme.Space.xs
     }
 
     var body: some View {
@@ -49,7 +51,7 @@ struct ActivitySection: View {
                     }
                 }
             }
-            .frame(height: Self.blockHeight, alignment: .top)
+            .frame(height: blockHeight, alignment: .top)
         }
     }
 
