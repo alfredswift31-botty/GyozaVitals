@@ -91,6 +91,57 @@ enum Theme {
         static let calm = Animation.easeOut(duration: 0.3)
         static let pressedScale: CGFloat = 0.98
     }
+
+    // MARK: GyozaVitals additions (docs/DESIGN.md "Measurements")
+
+    /// Ink opacities for stacked data: the first series full, the rest fading.
+    enum Emphasis {
+        static let primary: Double = 1
+        static let secondary: Double = 0.55
+        static let tertiary: Double = 0.25
+        /// A trace: a normal sample in the pressure strip.
+        static let trace: Double = 0.12
+    }
+
+    /// The meters: one 6 pt bar, one 4 pt strip.
+    enum Gauge {
+        static let barHeight: CGFloat = 6
+        /// Ruler marks under the bar at 25/50/75 %.
+        static let tickHeight: CGFloat = 3
+        static let ticks: [Double] = [0.25, 0.5, 0.75]
+        static let stripHeight: CGFloat = 4
+        static let stripSamples = 60
+        /// Canvas showing between stacked segments and strip samples.
+        static let gap: CGFloat = 1
+    }
+
+    /// The popover's grid.
+    enum Layout {
+        static let popoverWidth: CGFloat = 340
+        static let settingsWidth: CGFloat = 520
+        static let settingsHeight: CGFloat = 620
+        /// Label-over-value column: four to a row.
+        static let column: CGFloat = 77
+        /// The memory legend's five columns, summing to the 308 pt content column.
+        static let legendColumns: [CGFloat] = [60, 56, 56, 84, 52]
+        static let labelRow: CGFloat = 20
+        static let textRow: CGFloat = 16
+        static let modelRow: CGFloat = 44
+        static let footerRow: CGFloat = 36
+        static let activityRows = 5
+        static let modelRowsBeforeScrolling = 8
+    }
+
+    /// The status item: a template glyph and one mono number.
+    enum StatusItem {
+        static let glyphSize: CGFloat = 18
+        static let stroke: CGFloat = 1.5
+        static let pleat: CGFloat = 1
+        static let font = Font.system(size: 12).monospacedDigit()
+        /// The widest number the slot must hold.
+        static let widestMemory = "99.9G"
+        static let widestCount = "99"
+    }
 }
 
 private extension NSColor {
@@ -138,6 +189,8 @@ struct MetaPair: View {
     let label: String
     let value: String
     var monospaced = false
+    /// The value's colour when it must not be plain ink: `Theme.live` for a critical state.
+    var tint: Color? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -145,7 +198,7 @@ struct MetaPair: View {
             Text(value)
                 .font(monospaced ? Theme.Typeface.mono : Theme.Typeface.meta)
                 .monospacedDigit()
-                .foregroundStyle(Theme.ink)
+                .foregroundStyle(tint ?? Theme.ink)
                 .lineLimit(1)
         }
         .accessibilityElement(children: .combine)
@@ -308,5 +361,99 @@ extension View {
             .padding(.vertical, 7)
             .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.control))
             .overlay(RoundedRectangle(cornerRadius: Theme.Radius.control).strokeBorder(Theme.hairline))
+    }
+}
+
+// MARK: - Meters (GyozaVitals)
+
+/// A 6 pt bar: track in `wash`, fill in `ink`, square corners, with ruler
+/// marks under it at 25/50/75 %. The stacked form draws several fills at
+/// falling ink opacity, 1 pt of canvas between them; a segment may be `live`.
+struct Meter: View {
+    struct Segment: Equatable {
+        enum Fill: Equatable {
+            case ink(opacity: Double)
+            case live
+        }
+        var fraction: Double
+        var fill: Fill
+    }
+
+    let segments: [Segment]
+    var ticks: [Double] = Theme.Gauge.ticks
+
+    init(fraction: Double) {
+        segments = [Segment(fraction: fraction, fill: .ink(opacity: Theme.Emphasis.primary))]
+    }
+
+    init(stacked segments: [Segment]) {
+        self.segments = segments
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            ZStack(alignment: .topLeading) {
+                Rectangle()
+                    .fill(Theme.wash)
+                    .frame(height: Theme.Gauge.barHeight)
+                HStack(spacing: Theme.Gauge.gap) {
+                    ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                        Rectangle()
+                            .fill(color(for: segment.fill))
+                            .frame(width: max(0, width * min(max(segment.fraction, 0), 1) - Theme.Gauge.gap))
+                    }
+                }
+                .frame(height: Theme.Gauge.barHeight)
+                ForEach(ticks, id: \.self) { tick in
+                    Rectangle()
+                        .fill(Theme.hairline)
+                        .frame(width: 1, height: Theme.Gauge.tickHeight)
+                        .offset(x: (width * tick).rounded() - 0.5, y: Theme.Gauge.barHeight + Theme.Gauge.gap)
+                }
+            }
+        }
+        .frame(height: Theme.Gauge.barHeight + (ticks.isEmpty ? 0 : Theme.Gauge.gap + Theme.Gauge.tickHeight))
+        .accessibilityElement(children: .ignore)
+    }
+
+    private func color(for fill: Segment.Fill) -> Color {
+        switch fill {
+        case .ink(let opacity): Theme.ink.opacity(opacity)
+        case .live: Theme.live
+        }
+    }
+}
+
+/// Sixty samples of memory pressure, oldest on the left, 4 pt tall. Ink
+/// opacity follows the level; a critical sample is `live`; no sample is wash.
+struct PressureStrip: View {
+    /// Oldest first. Fewer than sixty are right-aligned; more keep the last sixty.
+    let samples: [MemoryPressure?]
+
+    var body: some View {
+        Canvas { context, size in
+            let count = Theme.Gauge.stripSamples
+            let recent = Array(samples.suffix(count))
+            let padded = Array<MemoryPressure?>(repeating: nil, count: max(0, count - recent.count)) + recent
+            let step = (size.width + Theme.Gauge.gap) / CGFloat(count)
+            for (index, sample) in padded.enumerated() {
+                let x = (CGFloat(index) * step).rounded()
+                let next = (CGFloat(index + 1) * step).rounded()
+                let cell = CGRect(x: x, y: 0, width: max(1, next - x - Theme.Gauge.gap), height: size.height)
+                context.fill(Path(cell), with: .color(Self.color(for: sample)))
+            }
+        }
+        .frame(height: Theme.Gauge.stripHeight)
+        .accessibilityElement(children: .ignore)
+    }
+
+    private static func color(for sample: MemoryPressure?) -> Color {
+        switch sample {
+        case .none: Theme.wash
+        case .normal: Theme.ink.opacity(Theme.Emphasis.trace)
+        case .warning: Theme.ink.opacity(Theme.Emphasis.secondary)
+        case .critical: Theme.live
+        }
     }
 }
