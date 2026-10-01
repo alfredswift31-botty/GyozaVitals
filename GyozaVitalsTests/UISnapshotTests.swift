@@ -31,7 +31,7 @@ struct UISnapshotTests {
     func popoverQuiet(dark: Bool) throws {
         let store = Fixtures.quietStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.quietPressure),
-                            name: "02-popover-quiet", size: CGSize(width: Self.width, height: 624), dark: dark)
+                            name: "02-popover-quiet", size: CGSize(width: Self.width, height: 560), dark: dark)
     }
 
     @Test(arguments: [false, true])
@@ -54,7 +54,7 @@ struct UISnapshotTests {
     func popoverSingle(dark: Bool) throws {
         let store = Fixtures.singleStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.quietPressure),
-                            name: "05-popover-single", size: CGSize(width: Self.width, height: 628), dark: dark)
+                            name: "05-popover-single", size: CGSize(width: Self.width, height: 564), dark: dark)
     }
 
     /// The status item in its three settings at 3x, and the glyph alone at 8x.
