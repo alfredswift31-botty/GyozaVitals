@@ -9,6 +9,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | 1.0 | 2026-10-02 | [v1.0](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0) |
 | 1.0.1 | 2026-10-02 | [v1.0.1](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.1) |
 | 1.0.2 | 2026-10-02 | [v1.0.2](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.2) |
+| 1.0.3 | 2026-10-02 | [v1.0.3](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.3) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -80,6 +81,16 @@ The owner's 16 GB Mac under 7 GB of swap, Qwen Image (sd.cpp) generating and Oll
 - Also: upscalers and face restorers (`esrgan`, `realesr`, `upscal`, `gfpgan`, `codeformer`, a `4x`/`2x` word) pass the generic weights filter at 32 MB instead of 100 MB, so a 64 MB RealESRGAN_x4plus.pth shows up as an `.unknown` runtime with role `.upscaler` and gets the busy heuristic.
 
 Unverifiable on CI (no runtimes there): the 4 s timeout against a pressured Ollama, the 3 % companion floor on real Metal work, and whether Ollama's process tree on the owner's version matches the fixtures (`llama-server` child for GGUF, `ollama runner` for the engine's own).
+
+## 1.0.3: the busy rule, third attempt, and a diagnostics pane (2 Oct 2026)
+1.0.2 mid-generation on the user's Mac: sd.cpp at step 11 of 17, 215 s per step, GPU 100 %, swap 6 GB, and still no `.executing`. Everything else in that screenshot was right (one row per model, "Qwen Image", legend summing to 16 GB, "models resident").
+
+Why the 1.0.2 rule failed: it credited the GPU only with exactly one candidate, and whisper.cpp counted as one because its model's device is `.unknown` rather than `.cpu`. With whisper resident there were always two candidates. The 3 % CPU floor was probably also above what a swap-bound Metal loop uses.
+
+- **Rule now:** candidates are runtimes with no API answer that hold a `.gpu`/`.split` model or are image runtimes (sd.cpp, mflux, ComfyUI, an unknown process with an upscaler file); whisper with unknown-device models is not one. At GPU ≥ 80 %, the candidate with the highest CPU share is credited, if it has at least 0.5 % of a core and twice the next candidate's share (or is alone). That keeps the upscaler guard: an upscaling process out-ranks an idle sd.cpp. CPU > 25 % of a core is still busy on its own; an API answer is never overridden.
+- **Diagnostics pane** at the bottom of Settings: one line per runtime with the probe note ("api answered", "no api", "api timed out, carried over"), CPU share, GPU utilisation, candidate or not, and which signal decided. Two attempts at this rule were tuned from outside the app; the next one is read from inside it.
+
+Unverified until the user's next screenshot: the 0.5 % floor against real Metal work.
 
 ## Working notes
 - Work goes on `develop`; releases come from `main`.
