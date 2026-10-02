@@ -10,6 +10,9 @@ enum Fixtures {
     static let gyozaYap = ClientApp(pid: 501, name: "GyozaYap", bundleIdentifier: "com.gyoza.GyozaYap")
     static let flow = ClientApp(pid: 502, name: "Flow", bundleIdentifier: "com.gyoza.Flow")
     static let bot = ClientApp(pid: 503, name: "python3", bundleIdentifier: nil)
+    static let shortcuts = ClientApp(pid: 504, name: "Shortcuts", bundleIdentifier: "com.apple.shortcuts")
+    /// A helper process with a long name, as the scanner reported on the owner's Mac.
+    static let helper = ClientApp(pid: 505, name: "Qwen Image Networking", bundleIdentifier: nil)
 
     static var runtimes: [RuntimeInstance] {
         [
@@ -29,7 +32,9 @@ enum Fixtures {
                         expiresAt: now.addingTimeInterval(252), state: .executing, role: .vision, clients: [gyozaYap], firstSeen: now.addingTimeInterval(-600)),
             LoadedModel(id: "900:hermes3:8b", name: "hermes3:8b", filePath: "/Users/me/.ollama/models/blobs/sha256-b2",
                         runtime: .ollama, pid: 900, sizeBytes: 4_920_000_000, device: .gpu, contextLength: 8_192,
-                        expiresAt: now.addingTimeInterval(37), state: .idle, role: .text, clients: [flow, bot], firstSeen: now.addingTimeInterval(-3_000)),
+                        // Four clients: the row shows two and "+2".
+                        expiresAt: now.addingTimeInterval(37), state: .idle, role: .text, clients: [gyozaYap, flow, bot, shortcuts],
+                        firstSeen: now.addingTimeInterval(-3_000)),
             LoadedModel(id: "910:/Users/me/image-gen/models/qwen-image-2.1-UC-Q4_K_M.gguf", name: "qwen-image-2.1-UC-Q4_K_M.gguf",
                         filePath: "/Users/me/image-gen/models/qwen-image-2.1-UC-Q4_K_M.gguf", runtime: .comfyUI, pid: 910,
                         sizeBytes: 4_600_000_000, device: .gpu, contextLength: nil, expiresAt: nil, state: .executing, role: .image, clients: [],
@@ -117,7 +122,8 @@ enum Fixtures {
                         expiresAt: now.addingTimeInterval(252), state: .executing, role: .vision, clients: [gyozaYap], firstSeen: now.addingTimeInterval(-600)),
             LoadedModel(id: "900:gemma3:27b", name: "gemma3:27b", filePath: nil,
                         runtime: .ollama, pid: 900, sizeBytes: 17_400_000_000, device: .split, contextLength: 8_192,
-                        expiresAt: nil, state: .loading, role: .text, clients: [flow], firstSeen: now),
+                        // Long helper names truncate at the tail; "loading" on the right must survive.
+                        expiresAt: nil, state: .loading, role: .text, clients: [helper, helper, flow], firstSeen: now),
             LoadedModel(id: "900:hermes3:8b", name: "hermes3:8b", filePath: nil,
                         runtime: .ollama, pid: 900, sizeBytes: 4_920_000_000, device: .gpu, contextLength: 8_192,
                         expiresAt: now.addingTimeInterval(2), state: .unloading, role: .text, clients: [], firstSeen: now.addingTimeInterval(-3_000)),
@@ -165,6 +171,13 @@ enum Fixtures {
                            events: [ActivityEvent(date: now.addingTimeInterval(-7_200), kind: .runtimeStarted, text: "whisper.cpp started")],
                            appleIntelligenceAvailable: nil)
     }
+
+    // MARK: What the memory meta line covers across the stores
+    //
+    // busyStore: models 27.4 GB · swap 1.2 GB (swap > 0)
+    // criticalStore: models 29.7 GB (+) · swap 5.8 GB
+    // singleStore: models 1.3 GB, swap 0 (no "· swap")
+    // quietStore: models 0, swap 0 ("no model memory")
 
     // MARK: Pressure history for the strip, oldest first
 

@@ -24,14 +24,14 @@ struct UISnapshotTests {
     func popoverBusy(dark: Bool) throws {
         let store = Fixtures.busyStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.busyPressure),
-                            name: "01-popover-busy", size: CGSize(width: Self.width, height: 804), dark: dark)
+                            name: "01-popover-busy", size: CGSize(width: Self.width, height: 820), dark: dark)
     }
 
     @Test(arguments: [false, true])
     func popoverQuiet(dark: Bool) throws {
         let store = Fixtures.quietStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.quietPressure),
-                            name: "02-popover-quiet", size: CGSize(width: Self.width, height: 560), dark: dark)
+                            name: "02-popover-quiet", size: CGSize(width: Self.width, height: 576), dark: dark)
     }
 
     @Test(arguments: [false, true])
@@ -46,7 +46,7 @@ struct UISnapshotTests {
     func popoverCritical(dark: Bool) throws {
         let store = Fixtures.criticalStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.criticalPressure),
-                            name: "04-popover-critical", size: CGSize(width: Self.width, height: 760), dark: dark)
+                            name: "04-popover-critical", size: CGSize(width: Self.width, height: 776), dark: dark)
     }
 
     /// One model, no clients, no GPU figures, on battery and charging.
@@ -54,7 +54,7 @@ struct UISnapshotTests {
     func popoverSingle(dark: Bool) throws {
         let store = Fixtures.singleStore()
         try Snapshot.render(Self.popover(store, pressure: Fixtures.quietPressure),
-                            name: "05-popover-single", size: CGSize(width: Self.width, height: 564), dark: dark)
+                            name: "05-popover-single", size: CGSize(width: Self.width, height: 580), dark: dark)
     }
 
     /// The status item in its three settings at 3x, and the glyph alone at 8x.

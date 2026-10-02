@@ -121,14 +121,26 @@ struct ModelRow: View {
                     .monospacedDigit()
                     .foregroundStyle(isUnloading ? Theme.inkTertiary : Theme.ink)
             }
-            HStack(alignment: .firstTextBaseline, spacing: Theme.Space.s) {
+            // Runtime · device and the state are sized first and never squeezed;
+            // the client names take what is left and truncate at the tail.
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
                 Text(detail)
                     .font(Theme.Typeface.meta)
                     .foregroundStyle(Theme.inkTertiary)
                     .lineLimit(1)
-                    .truncationMode(.tail)
+                    .fixedSize()
+                    .layoutPriority(1)
+                if let clientsText {
+                    Text(" · \(clientsText)")
+                        .font(Theme.Typeface.meta)
+                        .foregroundStyle(Theme.inkTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
                 Spacer(minLength: Theme.Space.s)
                 state
+                    .fixedSize()
+                    .layoutPriority(1)
             }
         }
         .frame(height: Theme.Layout.modelRow)
@@ -171,12 +183,24 @@ struct ModelRow: View {
         }
     }
 
+    /// "ollama · gpu": the part of line 2 that always survives.
     private var detail: String {
         var parts = [model.runtime.displayName]
         if let deviceWord { parts.append(deviceWord) }
-        if !model.clients.isEmpty { parts.append(model.clients.map(\.name).joined(separator: ", ")) }
         return parts.joined(separator: " · ")
     }
+
+    /// At most two client names, then "+N" for the rest: "GyozaYap, Flow +2".
+    /// Nil when nobody is connected. The accessibility label lists them all.
+    private var clientsText: String? {
+        let names = model.clients.map(\.name)
+        guard !names.isEmpty else { return nil }
+        let shown = names.prefix(Self.shownClients).joined(separator: ", ")
+        let rest = names.count - Self.shownClients
+        return rest > 0 ? "\(shown) +\(rest)" : shown
+    }
+
+    private static let shownClients = 2
 
     private var accessibilityText: String {
         var parts = [model.name, Formatting.bytes(model.sizeBytes), model.runtime.displayName]

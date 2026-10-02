@@ -120,11 +120,9 @@ enum Theme {
         static let popoverWidth: CGFloat = 340
         static let settingsWidth: CGFloat = 520
         static let settingsHeight: CGFloat = 700
-        /// Label-over-value column: four to a row.
+        /// Label-over-value column: four to a row. The memory legend is four
+        /// of these (APP / WIRED / COMPRESSED / FREE), filling the 308 pt content column.
         static let column: CGFloat = 77
-        /// The memory legend's first four columns; SWAP takes the rest of the
-        /// 308 pt content column, right-aligned, at least 12 pt clear of COMPRESSED.
-        static let legendColumns: [CGFloat] = [60, 56, 52, 90]
         static let labelRow: CGFloat = 20
         static let textRow: CGFloat = 16
         static let modelRow: CGFloat = 44

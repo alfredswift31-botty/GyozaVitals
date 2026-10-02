@@ -20,6 +20,7 @@ The same Swiss / typographic language as GyozaYap (`Theme.swift` is shared), app
 
 ## Components (in `Theme.swift` unless noted)
 - `MetaPair` — label over value. The legend rows.
+- `MemorySection` (`Views/`) — the stacked bar; a legend of **exactly the bar's parts plus the remainder**: APP / WIRED / COMPRESSED / FREE, four equal 77 pt columns, values mono; the pressure strip; then two fixed 16 pt rows. Row 1 is the status (headroom while normal, else `warning` / `critical`). Row 2 is a quiet meta line in `inkTertiary`, mono digits, for what the bar cannot show: `models 6.0 GB · swap 4.5 GB`. "models" is the runtimes' footprint, which overlaps APP and WIRED (on Apple silicon GPU buffers count as wired), so it is never a legend column; swap is disk, not RAM, so neither is it. The swap part is omitted when swap is 0; with no model memory and no swap the row reads `no model memory`. Both rows are always present so a tick never moves the popover.
 - `SectionLabel` — small bold uppercase with a hairline running right.
 - `Meter` (new) — a 6 pt bar: track `Theme.wash`, fill `Theme.ink`, radius 0, hairline ticks at 25/50/75 %. Stacked variant: fills at ink 100 % / 55 % / 25 % separated by 1 pt of canvas, plus a `live` segment only when the section is critical.
 - `PressureStrip` (new) — 60 samples × 5 pt, 4 pt tall; ink opacity maps to pressure; `live` fill while critical.
@@ -31,7 +32,7 @@ The same Swiss / typographic language as GyozaYap (`Theme.swift` is shared), app
 qwen3-vl:8b                                   6.1G
 ollama · gpu · GyozaYap, Flow        unloads 4:12
 ```
-Line 1: name in 13.5 semibold, size right-aligned in mono. Line 2: runtime · device · client app names in `inkTertiary` 12 pt; on the right, the state in mono: `loading` (with a small `ProgressView`), nothing when idle, `unloads 4:12` when Ollama has an expiry, `unloading` struck through. A `LiveDot` sits before the name only while executing. One header row of labels (NAME / SIZE) above the list, not per row.
+Line 1: name in 13.5 semibold, size right-aligned in mono. Line 2: runtime · device · client app names in `inkTertiary` 12 pt; at most two names, then `+N` for the rest (`GyozaYap, Flow +2`). On the right, the state in mono: `loading` (with a small `ProgressView`), nothing when idle, `unloads 4:12` when Ollama has an expiry, `unloading` struck through. Runtime · device and the state have layout priority and never truncate; only the client names do, at the tail. The row's accessibility label still lists every client. A `LiveDot` sits before the name only while executing. One header row of labels (NAME / SIZE) above the list, not per row.
 
 ## States
 - **Loading:** `inkSecondary` text plus `ProgressView().controlSize(.small)`.

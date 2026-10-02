@@ -1,11 +1,13 @@
 import SwiftUI
 
-/// MEMORY: one stacked bar (app / wired / compressed), the legend, the
-/// pressure strip, and one line: the headroom while pressure is normal, or
-/// the pressure level's word.
+/// MEMORY: one stacked bar (app / wired / compressed), a legend of exactly
+/// those parts plus the remainder (free), the pressure strip, and two fixed
+/// rows: the headroom or pressure word, then a quiet line for what the bar
+/// cannot show, the runtimes' footprint (it overlaps app and wired: on Apple
+/// silicon GPU buffers count as wired) and swap (disk, not RAM).
 struct MemorySection: View {
     let memory: MemorySnapshot?
-    /// The runtimes' footprints, what the MODELS column shows.
+    /// The runtimes' footprints, what the "models" figure in the meta line shows.
     let modelBytes: UInt64
     @ObservedObject var history: PressureHistory
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -24,8 +26,18 @@ struct MemorySection: View {
                 PressureStrip(samples: history.samples)
                     .accessibilityLabel("Memory pressure history")
                     .accessibilityValue(stripValue)
-                statusLine
-                    .frame(height: Theme.Layout.textRow)
+                // Two rows of fixed height: the popover must not move on a tick.
+                VStack(alignment: .leading, spacing: 0) {
+                    statusLine
+                        .frame(height: Theme.Layout.textRow, alignment: .leading)
+                    Text(metaLine)
+                        .font(Theme.Typeface.meta)
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.inkTertiary)
+                        .lineLimit(1)
+                        .frame(height: Theme.Layout.textRow, alignment: .leading)
+                        .accessibilityAddTraits(.updatesFrequently)
+                }
             }
         }
     }
@@ -43,19 +55,18 @@ struct MemorySection: View {
         ]
     }
 
+    /// The bar's three segments in order, then the remainder: four equal
+    /// columns on the 77 pt grid, so the legend reads as the bar.
     private var legend: some View {
-        let widths = Theme.Layout.legendColumns
-        return HStack(spacing: 0) {
-            MetaPair(label: "Models", value: memory == nil ? Self.dash : Formatting.bytes(modelBytes), monospaced: true)
-                .frame(width: widths[0], alignment: .leading)
+        HStack(spacing: 0) {
             MetaPair(label: "App", value: value(\.appBytes), monospaced: true)
-                .frame(width: widths[1], alignment: .leading)
+                .frame(width: Theme.Layout.column, alignment: .leading)
             MetaPair(label: "Wired", value: value(\.wiredBytes), monospaced: true)
-                .frame(width: widths[2], alignment: .leading)
+                .frame(width: Theme.Layout.column, alignment: .leading)
             MetaPair(label: "Compressed", value: value(\.compressedBytes), monospaced: true)
-                .frame(width: widths[3], alignment: .leading)
-            MetaPair(label: "Swap", value: value(\.swapUsedBytes), monospaced: true)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                .frame(width: Theme.Layout.column, alignment: .leading)
+            MetaPair(label: "Free", value: value(\.freeBytes), monospaced: true)
+                .frame(width: Theme.Layout.column, alignment: .leading)
         }
         .accessibilityAddTraits(.updatesFrequently)
     }
@@ -90,9 +101,20 @@ struct MemorySection: View {
         }
     }
 
+    /// "models 6.0 GB · swap 4.5 GB"; the swap part only while swap is in
+    /// use; "no model memory" when there is neither.
+    private var metaLine: String {
+        guard let memory else { return Self.dash }
+        var parts: [String] = []
+        if modelBytes > 0 { parts.append("models \(Formatting.bytes(modelBytes))") }
+        if memory.swapUsedBytes > 0 { parts.append("swap \(Formatting.bytes(memory.swapUsedBytes))") }
+        return parts.isEmpty ? "no model memory" : parts.joined(separator: " · ")
+    }
+
     private var meterValue: String {
         guard let memory else { return "unknown" }
-        return "\(Formatting.bytes(memory.usedBytes)) of \(Formatting.bytes(memory.totalBytes)) used, pressure \(memory.pressure.rawValue)"
+        return "\(Formatting.bytes(memory.usedBytes)) of \(Formatting.bytes(memory.totalBytes)) used, "
+            + "\(Formatting.bytes(memory.freeBytes)) free, pressure \(memory.pressure.rawValue), \(metaLine)"
     }
 
     private var stripValue: String {
