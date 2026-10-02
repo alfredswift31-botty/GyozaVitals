@@ -154,3 +154,80 @@ nonisolated enum FileProbe {
         return ProbeResult(version: nil, isBusy: nil, models: set.models(runtime: draft.kind, pid: process.pid, device: device, state: .idle))
     }
 }
+
+// MARK: - CPU-time heuristic
+
+/// Whether a runtime with no API to ask is working, from its CPU time: a
+/// process using more than a quarter of one core, averaged over the scan
+/// interval, is executing. Metal work still keeps a core busy encoding
+/// command buffers, so this holds for GPU-bound inference too.
+///
+/// Samples are kept per (pid, start time) across scans; the first scan of a
+/// process answers nil. Only `isBusy == nil` from a probe is replaced.
+nonisolated struct CPUActivity: Sendable {
+    nonisolated struct Key: Hashable, Sendable {
+        let pid: pid_t
+        let startTime: UInt64
+    }
+
+    nonisolated struct Sample: Hashable, Sendable {
+        let cpuSeconds: Double
+        let uptime: TimeInterval
+    }
+
+    nonisolated struct Delta: Hashable, Sendable {
+        let cpuSeconds: Double
+        let wallSeconds: Double
+    }
+
+    /// Above this share of one core the process counts as busy.
+    static let busyCoreFraction = 0.25
+    /// Below this many seconds between samples the ratio is noise.
+    static let minimumInterval = 0.05
+
+    private var samples: [Key: Sample] = [:]
+
+    init() {}
+
+    /// Busy, idle, or unknown when the interval is too short to say.
+    static func busy(cpuDelta: Double, wallDelta: Double) -> Bool? {
+        guard wallDelta >= minimumInterval, cpuDelta.isFinite, cpuDelta >= 0 else { return nil }
+        return cpuDelta / wallDelta > busyCoreFraction
+    }
+
+    /// The verdict for a group of processes (a runtime and its helpers):
+    /// their CPU time added up over the longest interval any of them has.
+    /// Nil when none has a previous sample.
+    static func busy(deltas: [Delta]) -> Bool? {
+        guard !deltas.isEmpty else { return nil }
+        let cpu = deltas.reduce(0) { $0 + $1.cpuSeconds }
+        let wall = deltas.map(\.wallSeconds).max() ?? 0
+        return busy(cpuDelta: cpu, wallDelta: wall)
+    }
+
+    /// Records this scan's readings and returns, per pid, the change since
+    /// the previous scan for the processes that were seen then with the same
+    /// start time. Processes not in `records` are forgotten.
+    mutating func observe(_ records: [ProcessRecord], at uptime: TimeInterval) -> [pid_t: Delta] {
+        var next: [Key: Sample] = [:]
+        var deltas: [pid_t: Delta] = [:]
+        for record in records {
+            let key = Key(pid: record.pid, startTime: record.startTime)
+            let sample = Sample(cpuSeconds: record.cpuSeconds, uptime: uptime)
+            if let previous = samples[key] {
+                deltas[record.pid] = Delta(cpuSeconds: sample.cpuSeconds - previous.cpuSeconds, wallSeconds: uptime - previous.uptime)
+            }
+            next[key] = sample
+        }
+        samples = next
+        return deltas
+    }
+}
+
+/// What one pass of the pipeline hands the main actor: the result, plus the
+/// parent chain of every connecting process so the apps can be resolved
+/// where NSRunningApplication may be asked.
+nonisolated struct PipelineOutput: Sendable {
+    var result: ScanResult
+    var clientChains: [pid_t: [ProcessChainLink]]
+}

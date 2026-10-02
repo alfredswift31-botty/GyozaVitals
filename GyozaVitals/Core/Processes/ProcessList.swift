@@ -19,6 +19,8 @@ nonisolated struct ProcessRecord: Hashable, Sendable {
     let startTime: UInt64
     /// Physical footprint in bytes (Activity Monitor's "Memory"); 0 when unknown.
     let footprintBytes: UInt64
+    /// CPU time used so far, user plus system, in seconds; 0 when unknown.
+    var cpuSeconds: Double = 0
 
     /// argv[0]'s last path component, e.g. "mflux-generate" for a Python script.
     var argumentName: String? {
@@ -55,6 +57,7 @@ nonisolated enum ProcessList {
             let path = executablePath(pid)
             var name = path.map { ($0 as NSString).lastPathComponent } ?? ""
             if name.isEmpty { name = processName(pid) ?? CStrings.string(info.pbi_comm) }
+            let resources = usage(pid)
             records.append(ProcessRecord(
                 pid: pid,
                 parentPID: pid_t(truncatingIfNeeded: info.pbi_ppid),
@@ -63,7 +66,8 @@ nonisolated enum ProcessList {
                 executablePath: path,
                 arguments: reader.arguments(pid),
                 startTime: info.pbi_start_tvsec,
-                footprintBytes: footprint(pid)))
+                footprintBytes: resources?.footprintBytes ?? 0,
+                cpuSeconds: resources?.cpuSeconds ?? 0))
         }
         return records
     }
@@ -107,11 +111,39 @@ nonisolated enum ProcessList {
 
     /// Physical footprint: what Activity Monitor calls Memory. 0 when refused.
     static func footprint(_ pid: pid_t) -> UInt64 {
+        usage(pid)?.footprintBytes ?? 0
+    }
+
+    /// CPU time used so far (user + system), in seconds. Nil when refused.
+    static func cpuSeconds(_ pid: pid_t) -> Double? {
+        usage(pid)?.cpuSeconds
+    }
+
+    /// One `proc_pid_rusage` call: the footprint and the CPU time. The kernel
+    /// reports `ri_user_time` and `ri_system_time` in Mach absolute time units.
+    static func usage(_ pid: pid_t) -> (footprintBytes: UInt64, cpuSeconds: Double)? {
         var usage = rusage_info_v4()
         let result = withUnsafeMutablePointer(to: &usage) {
             $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
         }
-        return result == 0 ? usage.ri_phys_footprint : 0
+        guard result == 0 else { return nil }
+        return (usage.ri_phys_footprint, MachTime.seconds(usage.ri_user_time &+ usage.ri_system_time))
+    }
+}
+
+/// Mach absolute time units → seconds, through `mach_timebase_info`
+/// (nanoseconds per tick on Intel, 125/3 on Apple silicon).
+nonisolated enum MachTime {
+    private static let timebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
+    static func seconds(_ ticks: UInt64) -> Double {
+        let timebase = Self.timebase
+        guard timebase.denom != 0, timebase.numer != 0 else { return Double(ticks) / 1e9 }
+        return Double(ticks) * Double(timebase.numer) / Double(timebase.denom) / 1e9
     }
 }
 
