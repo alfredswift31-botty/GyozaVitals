@@ -8,7 +8,7 @@ import FoundationModels
 /// The live `ModelScanSource`: processes → classification → files, sockets
 /// and footprint for the AI ones → runtime probes → client attribution.
 /// The work runs on `ScanPipeline`, an actor off the main thread; this
-/// class only remembers first-seen dates and names the client apps.
+/// class only remembers first-seen dates and resolves the client apps.
 final class ModelScanner: ModelScanSource {
     private let pipeline = ScanPipeline()
     private var firstSeen: [String: Date] = [:]
@@ -16,32 +16,29 @@ final class ModelScanner: ModelScanSource {
     init() {}
 
     func scan(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult {
-        var result = await pipeline.run(watched: watched, ports: ports)
+        let output = await pipeline.run(watched: watched, ports: ports)
+        var result = output.result
         let now = Date()
         var remembered: [String: Date] = [:]
+        var resolver = ClientResolver(chains: output.clientChains)
+        var byRuntime: [pid_t: [ClientApp]] = [:]
+        result.runtimes = result.runtimes.map { runtime in
+            var runtime = runtime
+            runtime.clients = resolver.resolve(runtime.clients)
+            byRuntime[runtime.pid] = runtime.clients
+            return runtime
+        }
         result.models = result.models.map { model in
             var model = model
             let date = firstSeen[model.id] ?? now
             remembered[model.id] = date
             model.firstSeen = date
-            model.clients = model.clients.map(Self.named)
+            model.clients = byRuntime[model.pid] ?? resolver.resolve(model.clients)
             return model
         }
         firstSeen = remembered
-        result.runtimes = result.runtimes.map { runtime in
-            var runtime = runtime
-            runtime.clients = runtime.clients.map(Self.named)
-            return runtime
-        }
         result.appleIntelligenceAvailable = Self.appleIntelligenceAvailability()
         return result
-    }
-
-    /// The app's own name and bundle id when the pid is an app; the
-    /// executable name the scanner already chose otherwise.
-    private static func named(_ client: ClientApp) -> ClientApp {
-        guard let app = NSRunningApplication(processIdentifier: client.pid) else { return client }
-        return ClientApp(pid: client.pid, name: app.localizedName ?? client.name, bundleIdentifier: app.bundleIdentifier ?? client.bundleIdentifier)
     }
 
     /// FoundationModels is weak-linked (it is newer than the deployment
@@ -60,12 +57,49 @@ final class ModelScanner: ModelScanSource {
     }
 }
 
+/// Turns the pipeline's connecting processes into the apps that own them:
+/// each link of a parent chain is looked up in NSRunningApplication (its
+/// localized name and bundle identifier), the chain is resolved, and the
+/// results are deduped per app. Main actor, since NSRunningApplication is.
+struct ClientResolver {
+    private let chains: [pid_t: [ProcessChainLink]]
+    private var resolved: [pid_t: ResolvedClient] = [:]
+
+    init(chains: [pid_t: [ProcessChainLink]]) {
+        self.chains = chains
+    }
+
+    mutating func resolve(_ clients: [ClientApp]) -> [ClientApp] {
+        ClientFinder.dedupe(clients.map { resolve($0) })
+    }
+
+    mutating func resolve(_ client: ClientApp) -> ResolvedClient {
+        if let known = resolved[client.pid] { return known }
+        let chain = (chains[client.pid] ?? [ProcessChainLink(pid: client.pid, name: client.name, executablePath: nil)]).map(Self.named)
+        let result = ClientFinder.resolveApp(chain: chain)
+            ?? ResolvedClient(app: ClientApp(pid: client.pid, name: client.name, bundleIdentifier: nil), isHelper: false)
+        resolved[client.pid] = result
+        return result
+    }
+
+    /// The app's own name and bundle id when the pid is an app; the kernel's
+    /// executable name otherwise.
+    static func named(_ link: ProcessChainLink) -> ProcessChainLink {
+        guard let app = NSRunningApplication(processIdentifier: link.pid) else { return link }
+        var link = link
+        if let name = app.localizedName, !name.isEmpty { link.name = name }
+        link.bundleIdentifier = app.bundleIdentifier ?? link.bundleIdentifier
+        return link
+    }
+}
+
 /// One scan, start to finish, off the main actor.
 actor ScanPipeline {
     private let client = HTTPClient(timeout: 1.5)
     private var manifestNames: [String: String] = [:]
     private var manifestRoots: [String] = []
     private var manifestsBuiltAt = Date.distantPast
+    private var cpuActivity = CPUActivity()
 
     /// Each probe gets this long; the file fallback answers for a slow one.
     static let probeDeadline: Double = 2.6
@@ -77,8 +111,9 @@ actor ScanPipeline {
     static let classifiedModelFloor: UInt64 = 8 * 1_048_576
     static let genericCandidateLimit = 40
 
-    func run(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult {
+    func run(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> PipelineOutput {
         let selfPID = getpid()
+        let sampledAt = ProcessInfo.processInfo.systemUptime
         let processes = ProcessList.currentUserProcesses()
         let byPID = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
 
@@ -92,6 +127,7 @@ actor ScanPipeline {
 
         let drafts = Self.drafts(from: aiProcesses, watched: watched, ports: ports)
         let manifests = await ollamaManifests(for: drafts)
+        let cpuDeltas = cpuActivity.observe(drafts.flatMap { $0.allProcesses.map(\.record) }, at: sampledAt)
 
         // Probe every draft at once, each within its deadline.
         let client = self.client
@@ -113,16 +149,44 @@ actor ScanPipeline {
         let allPorts = Set(drafts.flatMap { $0.allListeningPorts })
         let connections = ClientFinder.connections(to: allPorts, among: processes)
 
+        return Self.assemble(drafts: drafts, results: results, manifests: manifests, connections: connections,
+                             processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID)
+    }
+
+    /// Runtimes and models from what was found, pure: drafts, what their
+    /// probes said, who connects to their ports, and how much CPU they used
+    /// since the last scan.
+    static func assemble(drafts: [RuntimeDraft], results: [pid_t: ProbeResult], manifests: [String: String],
+                         connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
+                         cpuDeltas: [pid_t: CPUActivity.Delta], selfPID: pid_t) -> PipelineOutput {
         var runtimes: [RuntimeInstance] = []
         var models: [LoadedModel] = []
+        var chains: [pid_t: [ProcessChainLink]] = [:]
         for draft in drafts {
             let probe = results[draft.process.pid] ?? RuntimeProbes.offline(draft, ollamaManifests: manifests)
-            let clients = Self.clients(for: draft, connections: connections, excluding: draft.pids.union([selfPID]))
+            let clients = Self.clients(for: draft, connections: connections, processes: byPID,
+                                       excluding: draft.pids.union([selfPID]), chains: &chains)
+
+            // No answer from an API: the CPU-time heuristic decides, and a busy
+            // runtime's resident models are executing. Loading stays loading.
+            var isBusy = probe.isBusy
+            var probedModels = probe.models
+            if isBusy == nil {
+                isBusy = CPUActivity.busy(deltas: draft.pids.compactMap { cpuDeltas[$0] })
+                if isBusy == true {
+                    probedModels = probedModels.map { model in
+                        var model = model
+                        if model.state == .idle { model.state = .executing }
+                        return model
+                    }
+                }
+            }
+
             runtimes.append(RuntimeInstance(
                 pid: draft.process.pid, kind: draft.kind, processName: draft.process.record.name,
                 executablePath: draft.process.record.executablePath, listeningPorts: draft.process.listeningPorts,
-                version: probe.version, footprintBytes: draft.footprintBytes, isBusy: probe.isBusy, clients: clients))
-            models += probe.models.map { model in
+                version: probe.version, footprintBytes: draft.footprintBytes, isBusy: isBusy, clients: clients))
+            models += probedModels.map { model in
                 var model = model
                 model.clients = clients
                 return model
@@ -130,7 +194,7 @@ actor ScanPipeline {
         }
         runtimes.sort { ($0.kind.rawValue, $0.pid) < ($1.kind.rawValue, $1.pid) }
         models.sort { ($0.runtime.rawValue, $0.pid, $0.name) < ($1.runtime.rawValue, $1.pid, $1.name) }
-        return ScanResult(runtimes: runtimes, models: models, appleIntelligenceAvailable: nil)
+        return PipelineOutput(result: ScanResult(runtimes: runtimes, models: models, appleIntelligenceAvailable: nil), clientChains: chains)
     }
 
     // MARK: Processes
@@ -167,7 +231,7 @@ actor ScanPipeline {
 
     /// Ollama's runners fold into their server; LM Studio's helpers into the
     /// app; everything else is one runtime per process.
-    private static func drafts(from aiProcesses: [AIProcess], watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) -> [RuntimeDraft] {
+    static func drafts(from aiProcesses: [AIProcess], watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) -> [RuntimeDraft] {
         var drafts: [RuntimeDraft] = []
 
         let servers = aiProcesses.filter { $0.kind == .ollama && !$0.classification.isOllamaRunner }
@@ -219,11 +283,19 @@ actor ScanPipeline {
 
     // MARK: Clients
 
-    private static func clients(for draft: RuntimeDraft, connections: [Int: [ProcessRecord]], excluding: Set<pid_t>) -> [ClientApp] {
+    /// The connecting processes, as executable names; the main actor resolves
+    /// them to apps through their parent chains, which are recorded here. A
+    /// process whose chain passes through the runtime itself is its child,
+    /// not a client (Ollama talking to its runner, a server's own worker).
+    private static func clients(for draft: RuntimeDraft, connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
+                                excluding: Set<pid_t>, chains: inout [pid_t: [ProcessChainLink]]) -> [ClientApp] {
         var seen = Set<pid_t>()
         var clients: [ClientApp] = []
         for port in draft.allListeningPorts.sorted() {
             for process in connections[port] ?? [] where !excluding.contains(process.pid) && seen.insert(process.pid).inserted {
+                let chain = chains[process.pid] ?? ClientFinder.chain(from: process, among: byPID)
+                guard !ClientFinder.chain(chain, passesThrough: excluding) else { continue }
+                chains[process.pid] = chain
                 clients.append(ClientFinder.client(for: process))
             }
         }

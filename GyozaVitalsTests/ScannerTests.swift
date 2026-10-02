@@ -441,3 +441,389 @@ struct ModelScannerTests {
         }
     }
 }
+
+// MARK: - Client attribution: helpers collapse to their app
+
+struct ClientResolutionTests {
+    static let suffixCases: [(String, String)] = [
+        ("Qwen Image Helper (Networking)", "Qwen Image"),
+        ("Qwen Image Helper (GPU)", "Qwen Image"),
+        ("Qwen Image Helper (Renderer)", "Qwen Image"),
+        ("Qwen Image Helper (Plugin)", "Qwen Image"),
+        ("Qwen Image Helper", "Qwen Image"),
+        ("Qwen Image Networking", "Qwen Image"),
+        ("Qwen Image Web Content", "Qwen Image"),
+        ("Qwen Image WebContent", "Qwen Image"),
+        ("Qwen Image GPU", "Qwen Image"),
+        ("Google Chrome Helper (Renderer)", "Google Chrome"),
+        ("Code Helper (Plugin)", "Code"),
+        ("Safari", "Safari"),
+        ("GyozaYap", "GyozaYap"),
+        ("Networking", "Networking"),
+        ("Helper", "Helper"),
+        ("", ""),
+    ]
+
+    @Test(arguments: ClientResolutionTests.suffixCases) func stripsHelperSuffixes(name: String, expected: String) {
+        #expect(ClientFinder.stripHelperSuffix(name) == expected)
+    }
+
+    static func link(_ pid: pid_t, _ name: String, _ path: String?, bundle: String? = nil) -> ProcessChainLink {
+        ProcessChainLink(pid: pid, name: name, executablePath: path, bundleIdentifier: bundle)
+    }
+
+    static let qwen = "/Applications/Qwen Image.app/Contents/MacOS/Qwen Image"
+    static let qwenHelper = "/Applications/Qwen Image.app/Contents/Frameworks/Qwen Image Helper (Networking).app/Contents/MacOS/Qwen Image Helper (Networking)"
+
+    @Test func electronHelperResolvesToTheOuterApp() throws {
+        // Helper → app → (launchd). The app's own pid stands for it.
+        let chain = [
+            Self.link(51, "Qwen Image Helper (Networking)", Self.qwenHelper, bundle: "com.qwen.image.helper.Networking"),
+            Self.link(50, "Qwen Image", Self.qwen, bundle: "com.qwen.image"),
+        ]
+        let resolved = try #require(ClientFinder.resolveApp(chain: chain))
+        #expect(resolved.app == ClientApp(pid: 50, name: "Qwen Image", bundleIdentifier: "com.qwen.image"))
+        #expect(!resolved.isHelper)
+
+        // The helper alone (its parent unknown) still names the app, as a helper.
+        let alone = try #require(ClientFinder.resolveApp(chain: [chain[0]]))
+        #expect(alone.app.name == "Qwen Image")
+        #expect(alone.app.pid == 51)
+        #expect(alone.isHelper)
+    }
+
+    @Test func bundleFolderAndLocalizedNameMayDiffer() throws {
+        let chain = [
+            Self.link(61, "qwen-image-desktop Helper (GPU)",
+                      "/Applications/qwen-image-desktop.app/Contents/Frameworks/qwen-image-desktop Helper (GPU).app/Contents/MacOS/qwen-image-desktop Helper (GPU)"),
+            Self.link(60, "Qwen Image", "/Applications/qwen-image-desktop.app/Contents/MacOS/qwen-image-desktop", bundle: "com.qwen.image"),
+        ]
+        let resolved = try #require(ClientFinder.resolveApp(chain: chain))
+        #expect(resolved.app.pid == 60)
+        #expect(resolved.app.name == "Qwen Image")
+    }
+
+    @Test func webKitStyleHelperIsStrippedByName() throws {
+        // NSRunningApplication names WebKit's XPC services after the app.
+        let chain = [Self.link(70, "Qwen Image Networking", "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking", bundle: "com.apple.WebKit.Networking")]
+        let resolved = try #require(ClientFinder.resolveApp(chain: chain))
+        #expect(resolved.app.name == "Qwen Image")
+        #expect(resolved.isHelper)
+    }
+
+    @Test func childToolsBelongToTheAppAbove() throws {
+        let chain = [
+            Self.link(82, "node", "/usr/local/bin/node"),
+            Self.link(81, "sh", "/bin/sh"),
+            Self.link(80, "Flow", "/Applications/Flow.app/Contents/MacOS/Flow", bundle: "com.flow.app"),
+        ]
+        // A shell between them ends the walk: a tool run from a shell is the user's.
+        #expect(ClientFinder.resolveApp(chain: chain) == nil)
+        let direct = try #require(ClientFinder.resolveApp(chain: [chain[0], chain[2]]))
+        #expect(direct.app == ClientApp(pid: 80, name: "Flow", bundleIdentifier: "com.flow.app"))
+    }
+
+    @Test func commandLineToolsFromATerminalStayThemselves() {
+        let chain = [
+            Self.link(92, "curl", "/usr/bin/curl"),
+            Self.link(91, "zsh", "/bin/zsh"),
+            Self.link(90, "Terminal", "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", bundle: "com.apple.Terminal"),
+        ]
+        #expect(ClientFinder.resolveApp(chain: chain) == nil)
+        #expect(ClientFinder.resolveApp(chain: [Self.link(93, "ollama", "/opt/homebrew/bin/ollama"), chain[1]]) == nil)
+        #expect(ClientFinder.resolveApp(chain: []) == nil)
+    }
+
+    @Test func aDifferentAppAboveDoesNotTakeOver() throws {
+        let chain = [
+            Self.link(96, "GyozaYap", "/Applications/GyozaYap.app/Contents/MacOS/GyozaYap", bundle: "com.gyoza.GyozaYap"),
+            Self.link(95, "Xcode", "/Applications/Xcode.app/Contents/MacOS/Xcode", bundle: "com.apple.dt.Xcode"),
+        ]
+        let resolved = try #require(ClientFinder.resolveApp(chain: chain))
+        #expect(resolved.app.pid == 96)
+        #expect(resolved.app.name == "GyozaYap")
+    }
+
+    @Test func appBundlesOnPaths() {
+        let helper = ClientFinder.appBundle(onPath: Self.qwenHelper)
+        #expect(helper?.path == "/Applications/Qwen Image.app")
+        #expect(helper?.name == "Qwen Image")
+        #expect(helper?.nested == true)
+        let app = ClientFinder.appBundle(onPath: Self.qwen)
+        #expect(app?.path == "/Applications/Qwen Image.app")
+        #expect(app?.nested == false)
+        #expect(ClientFinder.appBundle(onPath: "/Applications/Ollama.app/Contents/Resources/ollama") == nil)
+        #expect(ClientFinder.appBundle(onPath: "/usr/bin/curl") == nil)
+    }
+
+    @Test func dedupesPerAppPreferringTheAppItself() {
+        let app = ClientApp(pid: 50, name: "Qwen Image", bundleIdentifier: "com.qwen.image")
+        let clients = [
+            ResolvedClient(app: ClientApp(pid: 70, name: "Qwen Image", bundleIdentifier: "com.apple.WebKit.Networking"), isHelper: true),
+            ResolvedClient(app: app, isHelper: false),
+            ResolvedClient(app: ClientApp(pid: 52, name: "qwen image", bundleIdentifier: nil), isHelper: true),
+            ResolvedClient(app: ClientApp(pid: 200, name: "curl", bundleIdentifier: nil), isHelper: false),
+            ResolvedClient(app: ClientApp(pid: 201, name: "curl", bundleIdentifier: nil), isHelper: false),
+        ]
+        let deduped = ClientFinder.dedupe(clients)
+        #expect(deduped == [ClientApp(pid: 200, name: "curl", bundleIdentifier: nil), app])
+        #expect(ClientFinder.dedupe([]).isEmpty)
+    }
+
+    static func record(_ pid: pid_t, parent: pid_t, _ name: String, _ path: String) -> ProcessRecord {
+        ProcessRecord(pid: pid, parentPID: parent, uid: 501, name: name, executablePath: path, arguments: [path],
+                      startTime: 1_790_000_000, footprintBytes: 100_000_000)
+    }
+
+    @Test func chainsFollowParentsAndStopAtLaunchdLoopsAndStrangers() {
+        let app = Self.record(50, parent: 1, "Qwen Image", Self.qwen)
+        let helper = Self.record(51, parent: 50, "Qwen Image Helper (Networking)", Self.qwenHelper)
+        let orphan = Self.record(60, parent: 59, "node", "/usr/local/bin/node")
+        let loopA = Self.record(70, parent: 71, "a", "/x/a")
+        let loopB = Self.record(71, parent: 70, "b", "/x/b")
+        let byPID = Dictionary(uniqueKeysWithValues: [app, helper, orphan, loopA, loopB].map { ($0.pid, $0) })
+        #expect(ClientFinder.chain(from: helper, among: byPID).map(\.pid) == [51, 50])
+        #expect(ClientFinder.chain(from: app, among: byPID).map(\.pid) == [50])
+        #expect(ClientFinder.chain(from: orphan, among: byPID).map(\.pid) == [60])
+        #expect(ClientFinder.chain(from: loopA, among: byPID).map(\.pid) == [70, 71])
+        let chain = ClientFinder.chain(from: helper, among: byPID)
+        #expect(ClientFinder.chain(chain, passesThrough: [50]))
+        #expect(!ClientFinder.chain(chain, passesThrough: [51]), "the client itself is not an ancestor")
+    }
+
+    @Test func thisProcessResolvesWithoutCrashing() {
+        let processes = ProcessList.currentUserProcesses()
+        let byPID = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        let me = processes.first { $0.pid == getpid() }
+        #expect(me != nil)
+        guard let me else { return }
+        let chain = ClientFinder.chain(from: me, among: byPID)
+        #expect(chain.first?.pid == getpid())
+        #expect(chain.count <= ClientFinder.chainLimit)
+        #expect(!ClientFinder.chain(chain, passesThrough: [getpid()]))
+        // Either the test host is an app (xctest in a bundle) or a tool: both are fine, never a crash.
+        if let resolved = ClientFinder.resolveApp(chain: chain) { #expect(!resolved.app.name.isEmpty) }
+    }
+}
+
+@MainActor
+struct ClientResolverTests {
+    @Test func resolvesThisProcessToANonEmptyName() {
+        let processes = ProcessList.currentUserProcesses()
+        let byPID = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        guard let me = processes.first(where: { $0.pid == getpid() }) else {
+            Issue.record("this process is missing from the listing")
+            return
+        }
+        var resolver = ClientResolver(chains: [me.pid: ClientFinder.chain(from: me, among: byPID)])
+        let clients = resolver.resolve([ClientFinder.client(for: me), ClientFinder.client(for: me)])
+        #expect(clients.count == 1)
+        #expect(clients.first?.name.isEmpty == false)
+        // A pid with no chain falls back to the name it came with.
+        let unknown = resolver.resolve([ClientApp(pid: 2_000_000_000, name: "curl", bundleIdentifier: nil)])
+        #expect(unknown == [ClientApp(pid: 2_000_000_000, name: "curl", bundleIdentifier: nil)])
+    }
+}
+
+// MARK: - CPU-time heuristic
+
+struct CPUActivityTests {
+    static let busyCases: [(Double, Double, Bool?)] = [
+        (0.0, 5.0, false),
+        (0.1, 1.0, false),
+        (0.25, 1.0, false), // exactly a quarter is not more than a quarter
+        (0.26, 1.0, true),
+        (1.0, 1.0, true),
+        (6.0, 5.0, true), // more than one core
+        (0.5, 0.0, nil), // no interval
+        (0.5, 0.01, nil), // too short to mean anything
+        (-1.0, 1.0, nil), // a counter that went backwards
+    ]
+
+    @Test(arguments: CPUActivityTests.busyCases) func busyFromDeltas(cpu: Double, wall: Double, expected: Bool?) {
+        #expect(CPUActivity.busy(cpuDelta: cpu, wallDelta: wall) == expected)
+    }
+
+    @Test func groupsAddCPUOverTheLongestInterval() {
+        #expect(CPUActivity.busy(deltas: []) == nil)
+        let quiet = CPUActivity.Delta(cpuSeconds: 0.2, wallSeconds: 5)
+        let working = CPUActivity.Delta(cpuSeconds: 1.5, wallSeconds: 5)
+        #expect(CPUActivity.busy(deltas: [quiet]) == false)
+        #expect(CPUActivity.busy(deltas: [quiet, working]) == true)
+        #expect(CPUActivity.busy(deltas: [quiet, quiet, quiet]) == false)
+    }
+
+    static func record(_ pid: pid_t, start: UInt64 = 1_790_000_000, cpu: Double) -> ProcessRecord {
+        ProcessRecord(pid: pid, parentPID: 1, uid: 501, name: "sd-server", executablePath: "/opt/homebrew/bin/sd-server",
+                      arguments: [], startTime: start, footprintBytes: 0, cpuSeconds: cpu)
+    }
+
+    @Test func samplesAreKeptPerPidAndStartTime() {
+        var activity = CPUActivity()
+        #expect(activity.observe([Self.record(10, cpu: 1.0), Self.record(11, cpu: 7.0)], at: 100).isEmpty, "first scan: unknown")
+        let second = activity.observe([Self.record(10, cpu: 3.0), Self.record(11, start: 1_790_000_500, cpu: 0.1)], at: 104)
+        #expect(second[10] == CPUActivity.Delta(cpuSeconds: 2.0, wallSeconds: 4.0))
+        #expect(second[11] == nil, "a restarted pid is a new process")
+        #expect(second[10].flatMap { CPUActivity.busy(deltas: [$0]) } == true)
+        // A process that skipped a scan starts over.
+        #expect(activity.observe([Self.record(11, start: 1_790_000_500, cpu: 0.2)], at: 109)[11] != nil)
+        #expect(activity.observe([Self.record(10, cpu: 3.1)], at: 114)[10] == nil)
+    }
+
+    @Test func thisProcessReadsAsBusyWhileBurningAndIdleAfter() throws {
+        func sample() -> (cpu: Double, wall: TimeInterval) {
+            (ProcessList.cpuSeconds(getpid()) ?? -1, ProcessInfo.processInfo.systemUptime)
+        }
+        let before = sample()
+        #expect(before.cpu >= 0, "rusage of our own process is always readable")
+
+        // Two threads spin for 0.6 s: well over a quarter of one core.
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.6
+        let threads = (0..<2).map { _ in
+            Thread {
+                var x = 0.0
+                while ProcessInfo.processInfo.systemUptime < deadline { x = (x + 1.0).squareRoot() }
+                _ = x
+            }
+        }
+        threads.forEach { $0.start() }
+        Thread.sleep(forTimeInterval: 0.65)
+        let burnt = sample()
+        #expect(burnt.cpu > before.cpu)
+        #expect(CPUActivity.busy(cpuDelta: burnt.cpu - before.cpu, wallDelta: burnt.wall - before.wall) == true)
+
+        // Then quiet. Other tests may run in parallel in this process, so up
+        // to three 0.3 s windows get a chance to read idle.
+        var idle = false
+        var last = burnt
+        for _ in 0..<3 where !idle {
+            Thread.sleep(forTimeInterval: 0.3)
+            let now = sample()
+            idle = CPUActivity.busy(cpuDelta: now.cpu - last.cpu, wallDelta: now.wall - last.wall) == false
+            last = now
+        }
+        #expect(idle, "the process never read as idle after the burn")
+    }
+
+    @Test func machTimeConverts() {
+        #expect(MachTime.seconds(0) == 0)
+        #expect(MachTime.seconds(1_000_000_000) > 0)
+        // A tick is 1 ns on Intel and 125/3 ns on Apple silicon: a billion
+        // ticks is 1 s or 41.7 s.
+        #expect((0.5...60).contains(MachTime.seconds(1_000_000_000)))
+    }
+}
+
+// MARK: - Assembling runtimes from drafts, probes and the heuristic
+
+struct ScanAssemblyTests {
+    static func process(_ pid: pid_t, parent: pid_t = 1, _ name: String, _ path: String, _ arguments: [String], kind: Classification,
+                        files: [ModelFile] = [], ports: [Int] = []) -> AIProcess {
+        let record = ProcessRecord(pid: pid, parentPID: parent, uid: 501, name: name, executablePath: path, arguments: arguments,
+                                   startTime: 1_790_000_000, footprintBytes: 3_000_000_000)
+        let sockets = ports.map { TCPSocket(state: .listening, localPort: $0, remotePort: 0, localIsLoopback: true, remoteIsLoopback: false) }
+        return AIProcess(record: record, classification: kind, sockets: sockets, files: files, currentDirectory: "/Users/me")
+    }
+
+    static let sdFiles = [
+        ModelFile(path: "/Users/me/models/qwen-image-Q4_K_M.gguf", sizeBytes: 11_000_000_000),
+        ModelFile(path: "/Users/me/models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", sizeBytes: 4_000_000_000),
+        ModelFile(path: "/Users/me/models/mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf", sizeBytes: 1_000_000_000),
+        ModelFile(path: "/Users/me/models/qwen_image_vae.safetensors", sizeBytes: 250_000_000),
+    ]
+
+    static func sdDraft() -> RuntimeDraft {
+        let sd = process(300, parent: 50, "sd-server", "/Users/me/sd/sd-server", ["sd-server", "--diffusion-model", "qwen-image-Q4_K_M.gguf", "--port", "7860"],
+                         kind: Classification(.sdcpp), files: sdFiles, ports: [7860])
+        return RuntimeDraft(kind: .sdcpp, process: sd, helpers: [], probePort: 7860)
+    }
+
+    @Test func busyRuntimeWithoutAnAPIMarksEveryFileExecuting() {
+        let draft = Self.sdDraft()
+        let working: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 4.5, wallSeconds: 5)]
+        let busy = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
+                                         cpuDeltas: working, selfPID: 1).result
+        #expect(busy.runtimes.count == 1)
+        #expect(busy.runtimes.first?.isBusy == true)
+        #expect(busy.models.count == Self.sdFiles.count)
+        #expect(busy.models.allSatisfy { $0.state == ModelState.executing })
+
+        let resting: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.1, wallSeconds: 5)]
+        let idle = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
+                                         cpuDeltas: resting, selfPID: 1).result
+        #expect(idle.runtimes.first?.isBusy == false)
+        #expect(idle.models.allSatisfy { $0.state == ModelState.idle })
+
+        let first = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
+                                          cpuDeltas: [:], selfPID: 1).result
+        #expect(first.runtimes.first?.isBusy == nil, "no previous sample: unknown")
+        #expect(first.models.allSatisfy { $0.state == ModelState.idle })
+    }
+
+    @Test func anAPIAnswerIsNeverOverriddenAndLoadingStaysLoading() {
+        let llama = Self.process(400, "llama-server", "/opt/homebrew/bin/llama-server", ["llama-server", "-m", "x.gguf"],
+                                 kind: Classification(.llamaServer), ports: [8080])
+        let draft = RuntimeDraft(kind: .llamaServer, process: llama, helpers: [], probePort: 8080)
+        func model(_ name: String, _ state: ModelState) -> LoadedModel {
+            LoadedModel(id: "400:\(name)", name: name, filePath: nil, runtime: .llamaServer, pid: 400, sizeBytes: 1, device: .gpu,
+                        contextLength: nil, expiresAt: nil, state: state, role: .text, clients: [], firstSeen: Date())
+        }
+        let working: [pid_t: CPUActivity.Delta] = [400: CPUActivity.Delta(cpuSeconds: 5, wallSeconds: 5)]
+
+        let answered = ScanPipeline.assemble(
+            drafts: [draft], results: [400: ProbeResult(version: "b1", isBusy: false, models: [model("a", .idle)])],
+            manifests: [:], connections: [:], processes: [:], cpuDeltas: working, selfPID: 1).result
+        #expect(answered.runtimes.first?.isBusy == false, "the API said idle; CPU time does not override it")
+        #expect(answered.models.first?.state == .idle)
+
+        let silent = ScanPipeline.assemble(
+            drafts: [draft], results: [400: ProbeResult(version: nil, isBusy: nil, models: [model("a", .idle), model("b", .loading)])],
+            manifests: [:], connections: [:], processes: [:], cpuDeltas: working, selfPID: 1).result
+        #expect(silent.runtimes.first?.isBusy == true)
+        #expect(silent.models.map(\.state) == [ModelState.executing, ModelState.loading], "idle becomes executing; loading stays")
+    }
+
+    @Test func ollamaWithNoModelsIsStillARuntime() {
+        let ollama = Self.process(500, "ollama", "/Applications/Ollama.app/Contents/Resources/ollama",
+                                  ["/Applications/Ollama.app/Contents/Resources/ollama", "serve"], kind: Classification(.ollama), ports: [11434])
+        let drafts = ScanPipeline.drafts(from: [ollama], watched: [.ollama, .sdcpp], ports: [:])
+        #expect(drafts.count == 1)
+        #expect(drafts.first?.kind == .ollama)
+        #expect(drafts.first?.probePort == 11434)
+        let output = ScanPipeline.assemble(drafts: drafts, results: [500: ProbeResult(version: "0.12.3", isBusy: nil, models: [])],
+                                           manifests: [:], connections: [:], processes: [:], cpuDeltas: [:], selfPID: 1)
+        #expect(output.result.models.isEmpty)
+        #expect(output.result.runtimes.map(\.kind) == [.ollama])
+        #expect(output.result.runtimes.first?.version == "0.12.3")
+        #expect(output.result.runtimes.first?.footprintBytes == 3_000_000_000, "the footprint counts even with nothing loaded")
+        #expect(output.result.runtimes.first?.listeningPorts == [11434])
+    }
+
+    @Test func clientsSkipTheServersOwnChildrenAndCarryTheirChains() {
+        let draft = Self.sdDraft()
+        func record(_ pid: pid_t, parent: pid_t, _ name: String, _ path: String) -> ProcessRecord {
+            ProcessRecord(pid: pid, parentPID: parent, uid: 501, name: name, executablePath: path, arguments: [path],
+                          startTime: 1_790_000_000, footprintBytes: 1)
+        }
+        let app = record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
+        let helper = record(51, parent: 50, "Qwen Image Helper (Networking)", ClientResolutionTests.qwenHelper)
+        let worker = record(301, parent: 300, "sd-worker", "/Users/me/sd/sd-worker")
+        let curl = record(900, parent: 1, "curl", "/usr/bin/curl")
+        let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app, helper, worker, curl].map { ($0.pid, $0) })
+        let output = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [7860: [worker, helper, curl, app]],
+                                           processes: byPID, cpuDeltas: [:], selfPID: 1)
+        let clients = output.result.runtimes.first?.clients ?? []
+        #expect(clients.map(\.pid) == [900, 50, 51], "sorted by name; the server's own child is not a client")
+        #expect(output.clientChains[51]?.map(\.pid) == [51, 50])
+        #expect(output.clientChains[301] == nil)
+        #expect(output.result.models.allSatisfy { $0.clients == clients })
+
+        // The main actor's resolution, without NSRunningApplication: the chain alone collapses the helper.
+        let resolved = ClientFinder.dedupe(clients.map { client in
+            ClientFinder.resolveApp(chain: output.clientChains[client.pid] ?? [])
+                ?? ResolvedClient(app: client, isHelper: false)
+        })
+        #expect(resolved.map(\.name) == ["curl", "Qwen Image"])
+        #expect(resolved.last?.pid == 50)
+    }
+}
