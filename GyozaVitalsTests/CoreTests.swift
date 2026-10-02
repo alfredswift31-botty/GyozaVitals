@@ -37,9 +37,20 @@ struct MemorySnapshotTests {
 
 @MainActor
 struct VitalsStoreTests {
+    @Test func firstScanSeedsSilently() async {
+        let scanner = SequenceScanner(results: [
+            ScanResult(runtimes: Fixtures.runtimes, models: Fixtures.models, appleIntelligenceAvailable: nil),
+        ])
+        let store = VitalsStore(settings: Fixtures.settings(), metrics: StaticMetrics(snapshot: Fixtures.system), scanner: scanner)
+        await store.refreshScan()
+        #expect(store.events.isEmpty)
+        #expect(store.models.count == Fixtures.models.count)
+    }
+
     @Test func diffRecordsLoadsEvictionsAndUnloads() async {
         let settings = Fixtures.settings()
         let scanner = SequenceScanner(results: [
+            .empty,
             ScanResult(runtimes: Fixtures.runtimes, models: Fixtures.models, appleIntelligenceAvailable: nil),
             // Ollama still up but hermes3 gone: evicted. whisper gone with its process: unloaded.
             ScanResult(runtimes: Fixtures.runtimes.filter { $0.kind != .whisper },
@@ -47,6 +58,7 @@ struct VitalsStoreTests {
                        appleIntelligenceAvailable: nil),
         ])
         let store = VitalsStore(settings: settings, metrics: StaticMetrics(snapshot: Fixtures.system), scanner: scanner)
+        await store.refreshScan()
         await store.refreshScan()
         #expect(store.events.filter { $0.kind == .loaded }.count == Fixtures.models.count)
         #expect(store.events.filter { $0.kind == .runtimeStarted }.count == Fixtures.runtimes.count)

@@ -119,9 +119,16 @@ final class VitalsStore: ObservableObject {
         system = next
     }
 
+    /// The first scan only seeds the picture; logging everything already
+    /// running as "started" at launch would date it wrongly.
+    private var hasScanned = false
+
     func refreshScan() async {
         let result = await scanner.scan(watched: settings.watchedRuntimes, ports: settings.ports)
-        diff(old: models, new: result.models, oldRuntimes: runtimes, newRuntimes: result.runtimes)
+        if hasScanned {
+            diff(old: models, new: result.models, oldRuntimes: runtimes, newRuntimes: result.runtimes)
+        }
+        hasScanned = true
         runtimes = result.runtimes
         models = result.models
         appleIntelligenceAvailable = result.appleIntelligenceAvailable
