@@ -7,6 +7,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | Version | Date | Release |
 |---|---|---|
 | 1.0 | 2026-10-02 | [v1.0](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0) |
+| 1.0.1 | 2026-10-02 | [v1.0.1](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.1) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -39,7 +40,7 @@ Two CI lessons from the scanner: the SDK struct is `proc_vnodepathinfo` (not `vn
 CI is green on macOS 26: build, all tests (core, metrics on the real runner, scanner on the real test process, snapshots), the built app checked for `LSUIElement`, no sandbox entitlement and a compiled icon.
 
 ## Not verified (needs the user's Mac)
-- Any real runtime. CI has no Ollama, koboldcpp, ComfyUI or whisper; the probes were only shown to degrade cleanly there. The first run on the user's Mac is the real test of: Ollama model names and the unload countdown, runner `/slots` saying "executing", ComfyUI's mapped `.safetensors` appearing with the right roles, whisper found from its `-m` argument, and "used by" naming Flow and the bot.
+- Ollama with models loaded (names, unload countdown, runner `/slots` "executing"), koboldcpp, and "used by" naming Flow and the bot. The first real run (1.0, see 1.0.1 below) verified sd.cpp, whisper, an idle Ollama and the system figures.
 - GPU figures on macOS 26/27 (the IOKit key may be absent on some chips: the row hides).
 - The P/E-core index ordering assumption.
 - The status glyph on the Clear and Tinted menu bars.
@@ -53,6 +54,18 @@ CI is green on macOS 26: build, all tests (core, metrics on the real runner, sca
 
 ## Next (1.1 candidates)
 Unload buttons behind a confirmation (Ollama `keep_alive: 0`, ComfyUI `/free`); a notification when pressure goes critical while a model is executing; SMC fans and power; per-process GPU time; an icon source at 1024 px.
+
+## 1.0.1: fixes from the first real run (2 Oct 2026)
+The user installed 1.0 on a 16 GB Apple-silicon Mac with Qwen Image generating. What worked on the first run: Qwen Image's runtime was identified as **sd.cpp** (not ComfyUI, as the plan had assumed) with all four files (UNet, Qwen3-VL encoder, mmproj, VAE) found through the memory-map scan; Whisper found from its `-m` argument; Ollama detected with no models; pressure *warning*, 4.5 GB swap, GPU 100 %, thermal *fair*, all consistent. The menu bar glyph and number sat at the weight of Apple's own items.
+
+Four things were wrong, all fixed:
+- **Fake activity at launch.** The first scan logged everything already running as "started" at launch time. Now the first scan seeds silently; only later changes are logged. (`VitalsStore.hasScanned`.)
+- **Helper processes as clients.** The sd.cpp rows said "used by Qwen Image Networking, Qwen Ima…": the Qwen Image app's WebKit/Electron-style helpers, each with its own connection. `ClientFinder` now walks each client's parent chain, resolves it to the owning app (nested `.app` bundle path, or the known helper suffixes), dedupes per app and keeps the app's own pid. The app that launched the server stays a client (it's a sibling, not the server's child).
+- **No "executing" without an API.** sd.cpp, mflux, whisper and unknown runtimes showed idle at 100 % GPU. `CPUActivity` keeps `ri_user_time + ri_system_time` per process across scans; cpu/wall > 0.25 of a core marks the runtime busy and its models `.executing`. Applied only when the probe gave no answer; an API's answer is never overridden. First scan: unknown.
+- **The memory legend lied about the bar.** MODELS and SWAP sat in the legend as if they were bar segments; MODELS overlaps APP and WIRED (GPU buffers count as wired on Apple silicon), so MODELS 6.0 GB next to APP 2.4 GB looked contradictory. The legend is now APP / WIRED / COMPR. / FREE, exactly the bar; "models 6.0 GB · swap 4.5 GB" is its own line below the pressure strip.
+- Also: client names in a row are capped at two plus "+N", and the state column keeps priority.
+
+Still unverified on CI (no sd.cpp there): the 0.25-core busy threshold under real Metal inference, and the Qwen Image helper tree's actual names. The user's next look at the popover during a generation is the check.
 
 ## Working notes
 - Work goes on `develop`; releases come from `main`.
