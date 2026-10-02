@@ -102,12 +102,13 @@ struct MemorySection: View {
         }
     }
 
-    /// "models 6.0 GB · swap 4.5 GB"; the swap part only while swap is in
+    /// "models resident 6.0 GB · swap 4.5 GB": resident, because a freshly mapped
+    /// file counts only once its pages are touched; the swap part only while swap is in
     /// use; "no model memory" when there is neither.
     private var metaLine: String {
         guard let memory else { return Self.dash }
         var parts: [String] = []
-        if modelBytes > 0 { parts.append("models \(Formatting.bytes(modelBytes))") }
+        if modelBytes > 0 { parts.append("models resident \(Formatting.bytes(modelBytes))") }
         if memory.swapUsedBytes > 0 { parts.append("swap \(Formatting.bytes(memory.swapUsedBytes))") }
         return parts.isEmpty ? "no model memory" : parts.joined(separator: " · ")
     }
