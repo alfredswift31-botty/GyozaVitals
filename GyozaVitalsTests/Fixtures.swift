@@ -14,14 +14,23 @@ enum Fixtures {
     /// A helper process with a long name, as the scanner reported on the owner's Mac.
     static let helper = ClientApp(pid: 505, name: "Qwen Image Networking", bundleIdentifier: nil)
 
+    /// With what the busy heuristic saw, as the Settings diagnostics show it:
+    /// Ollama answered its API; ComfyUI's API timed out and the GPU was
+    /// credited to it; whisper has no API and only a trickle of CPU.
     static var runtimes: [RuntimeInstance] {
         [
             RuntimeInstance(pid: 900, kind: .ollama, processName: "ollama", executablePath: "/Applications/Ollama.app/Contents/Resources/ollama",
-                            listeningPorts: [11434], version: "0.19.2", footprintBytes: 11_200_000_000, isBusy: true, clients: [gyozaYap, flow, bot]),
+                            listeningPorts: [11434], version: "0.19.2", footprintBytes: 11_200_000_000, isBusy: true, clients: [gyozaYap, flow, bot],
+                            diagnostics: BusyDiagnostics(cpuShare: 0.412, gpuUtilization: 0.97, candidate: false, decidedBy: "api"),
+                            probeNote: "api answered"),
             RuntimeInstance(pid: 910, kind: .comfyUI, processName: "python3", executablePath: "/Users/me/ComfyUI/.venv/bin/python3",
-                            listeningPorts: [8188], version: "0.4.1", footprintBytes: 14_900_000_000, isBusy: true, clients: []),
+                            listeningPorts: [8188], version: "0.4.1", footprintBytes: 14_900_000_000, isBusy: true, clients: [],
+                            diagnostics: BusyDiagnostics(cpuShare: 0.012, gpuUtilization: 0.97, candidate: true, decidedBy: "gpu"),
+                            probeNote: "api timed out, carried over"),
             RuntimeInstance(pid: 920, kind: .whisper, processName: "whisper-stream", executablePath: "/usr/local/bin/whisper-stream",
-                            listeningPorts: [], version: nil, footprintBytes: 1_300_000_000, isBusy: false, clients: []),
+                            listeningPorts: [], version: nil, footprintBytes: 1_300_000_000, isBusy: false, clients: [],
+                            diagnostics: BusyDiagnostics(cpuShare: 0.003, gpuUtilization: 0.97, candidate: false, decidedBy: "none"),
+                            probeNote: "no api"),
         ]
     }
 

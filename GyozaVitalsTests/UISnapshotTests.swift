@@ -34,11 +34,14 @@ struct UISnapshotTests {
                             name: "02-popover-quiet", size: CGSize(width: Self.width, height: 576), dark: dark)
     }
 
+    /// The busy store, so the diagnostics section has one line per runtime,
+    /// at the Form's full content height (the window itself scrolls).
     @Test(arguments: [false, true])
     func settings(dark: Bool) throws {
-        let store = Fixtures.quietStore()
-        try Snapshot.render(SettingsView().environmentObject(store.settings).environmentObject(store),
-                            name: "03-settings", size: CGSize(width: Theme.Layout.settingsWidth, height: Theme.Layout.settingsHeight), dark: dark)
+        let store = Fixtures.busyStore()
+        let height: CGFloat = 1160
+        try Snapshot.render(SettingsView(height: height).environmentObject(store.settings).environmentObject(store),
+                            name: "03-settings", size: CGSize(width: Theme.Layout.settingsWidth, height: height), dark: dark)
     }
 
     /// Memory pressure critical, thermal critical, a model executing, one loading, one unloading.

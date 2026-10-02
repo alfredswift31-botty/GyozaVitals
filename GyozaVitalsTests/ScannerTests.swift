@@ -644,23 +644,48 @@ struct CPUActivityTests {
         #expect(CPUActivity.busy(cpuDelta: cpu, wallDelta: wall) == expected)
     }
 
-    /// (cpu share of a core, system GPU, GPU candidates) → busy / idle / unknown.
-    static let combinedCases: [(Double?, Double?, Int, Bool?)] = [
-        (nil, 0.96, 1, nil), // no CPU sample yet: unknown, whatever the GPU says
-        (0.30, nil, 0, true), // the CPU rule alone
-        (0.10, nil, 0, false),
-        (0.10, 0.96, 1, true), // Metal-bound sd.cpp: the only GPU candidate is credited
-        (0.10, 0.96, 2, false), // the upscaler case: two candidates share the GPU, neither is credited
-        (0.10, 0.96, 0, false), // not a GPU user at all
-        (0.02, 0.96, 1, false), // under the companion floor: a game or a video owns the GPU
-        (0.10, 0.50, 1, false), // GPU not busy
-        (0.03, 0.80, 1, true), // both floors are inclusive
-        (0.26, 0.0, 2, true), // the CPU rule wins regardless of candidates
-        (0.26, nil, 0, true),
+    /// (cpu share of a core, system GPU, credited with the GPU) → busy / idle / unknown.
+    static let combinedCases: [(Double?, Double?, Bool, Bool?)] = [
+        (nil, 0.96, true, nil), // no CPU sample yet: unknown, whatever the GPU says
+        (0.30, nil, false, true), // the CPU rule alone
+        (0.10, nil, false, false),
+        (0.01, 0.96, true, true), // Metal-bound sd.cpp at a hundredth of a core: credited, so busy
+        (0.10, 0.96, false, false), // not credited: another candidate out-ranks it, or none stands out
+        (0.10, 0.50, true, false), // GPU not busy
+        (0.005, 0.80, true, true), // both floors are inclusive
+        (0.26, 0.0, false, true), // the CPU rule wins regardless of the GPU
+        (0.26, nil, false, true),
     ]
 
-    @Test(arguments: CPUActivityTests.combinedCases) func busyFromCPUAndGPU(share: Double?, gpu: Double?, candidates: Int, expected: Bool?) {
-        #expect(CPUActivity.busy(cpuShare: share, gpuUtilization: gpu, gpuCandidates: candidates) == expected)
+    @Test(arguments: CPUActivityTests.combinedCases) func busyFromCPUAndGPU(share: Double?, gpu: Double?, credited: Bool, expected: Bool?) {
+        #expect(CPUActivity.busy(cpuShare: share, gpuUtilization: gpu, gpuCredited: credited) == expected)
+    }
+
+    @Test func verdictNamesTheRule() {
+        #expect(CPUActivity.verdict(cpuShare: nil, gpuUtilization: 1.0, gpuCredited: true).decidedBy == "first scan")
+        #expect(CPUActivity.verdict(cpuShare: 0.3, gpuUtilization: 1.0, gpuCredited: true).decidedBy == "cpu")
+        #expect(CPUActivity.verdict(cpuShare: 0.01, gpuUtilization: 1.0, gpuCredited: true).decidedBy == "gpu")
+        #expect(CPUActivity.verdict(cpuShare: 0.01, gpuUtilization: 1.0, gpuCredited: false).decidedBy == "none")
+        #expect(CPUActivity.verdict(cpuShare: 0.01, gpuUtilization: nil, gpuCredited: true).decidedBy == "none")
+    }
+
+    /// (system GPU, candidates by pid with their CPU share) → the pid the GPU is credited to.
+    static let creditCases: [(Double?, [pid_t: Double?], pid_t?)] = [
+        (1.0, [300: 0.01], 300), // the only candidate, above half a percent
+        (1.0, [300: 0.01, 920: 0.0], 300), // a sleeping companion doesn't block it
+        (1.0, [300: 0.004], nil), // under the floor: a game or a video owns the GPU
+        (1.0, [300: 0.02, 700: 0.015], nil), // within 2× of each other: neither
+        (1.0, [300: 0.02, 700: 0.01], 300), // exactly 2× is enough
+        (1.0, [300: 0.01, 700: 0.30], 700), // the upscaler out-ranks an idle sd.cpp
+        (1.0, [300: 0.01, 700: nil], 300), // a candidate on its first scan can't be ranked
+        (1.0, [300: nil], nil),
+        (0.5, [300: 0.30], nil), // GPU not busy
+        (nil, [300: 0.30], nil), // GPU not reported
+        (1.0, [:], nil),
+    ]
+
+    @Test(arguments: CPUActivityTests.creditCases) func theGPUGoesToTheCandidateThatStandsOut(gpu: Double?, candidates: [pid_t: Double?], expected: pid_t?) {
+        #expect(CPUActivity.gpuCredit(gpuUtilization: gpu, candidates: candidates) == expected)
     }
 
     @Test func shareIsCPUOverWall() {
@@ -784,6 +809,7 @@ struct ScanAssemblyTests {
                                           cpuDeltas: [:], selfPID: 1).result
         #expect(first.runtimes.first?.isBusy == nil, "no previous sample: unknown")
         #expect(first.models.allSatisfy { $0.state == ModelState.idle })
+        #expect(first.runtimes.first?.diagnostics == BusyDiagnostics(cpuShare: nil, gpuUtilization: nil, candidate: true, decidedBy: "first scan"))
     }
 
     @Test func anAPIAnswerIsNeverOverriddenAndLoadingStaysLoading() {
@@ -818,7 +844,20 @@ struct ScanAssemblyTests {
         #expect(later.models.map(\.state) == [ModelState.executing, ModelState.executing])
     }
 
-    @Test func theGPUIsCreditedToTheOnlyGPURuntimeWithoutAnAPI() {
+    static func whisperDraft() -> RuntimeDraft {
+        let model = ModelFile(path: "/Users/me/.local/share/whisper/ggml-large-v3-turbo-q5_0.bin", sizeBytes: 574_000_000)
+        let whisper = process(920, "whisper-stream", "/usr/local/bin/whisper-stream", ["whisper-stream", "-m", model.path],
+                              kind: Classification(.whisper), files: [model])
+        return RuntimeDraft(kind: .whisper, process: whisper, helpers: [], probePort: nil)
+    }
+
+    static func upscalerDraft() -> RuntimeDraft {
+        let esrgan = ModelFile(path: "/Users/me/upscalers/RealESRGAN_x4plus.pth", sizeBytes: 64 * 1_048_576)
+        let app = process(700, "Qwen Image", ClientResolutionTests.qwen, [ClientResolutionTests.qwen], kind: Classification(.unknown), files: [esrgan])
+        return RuntimeDraft(kind: .unknown, process: app, helpers: [], probePort: nil)
+    }
+
+    @Test func theGPUIsCreditedToTheCandidateThatStandsOut() {
         let draft = Self.sdDraft()
         // sd.cpp generating on Metal: 10 % of a core, GPU at 96 %.
         let trickle: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.5, wallSeconds: 5)]
@@ -826,30 +865,57 @@ struct ScanAssemblyTests {
                                           cpuDeltas: trickle, selfPID: 1, gpuUtilization: 0.96).result
         #expect(alone.runtimes.first?.isBusy == true)
         #expect(alone.models.allSatisfy { $0.state == ModelState.executing })
+        #expect(alone.runtimes.first?.diagnostics == BusyDiagnostics(cpuShare: 0.1, gpuUtilization: 0.96, candidate: true, decidedBy: "gpu"))
+        #expect(alone.runtimes.first?.probeNote == "no api")
 
         // Without the GPU figure the CPU rule alone says idle.
         let blind = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
                                           cpuDeltas: trickle, selfPID: 1, gpuUtilization: nil).result
         #expect(blind.runtimes.first?.isBusy == false)
+        #expect(blind.runtimes.first?.diagnostics?.decidedBy == "none")
+
+        // The owner's Mac mid-generation: whisper-stream resident (model device
+        // unknown, no API) beside sd.cpp at a hundredth of a core, GPU 100 %.
+        // whisper is not a candidate, so sd.cpp alone gets the GPU.
+        let whisper = Self.whisperDraft()
+        let swapping: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.05, wallSeconds: 5), 920: CPUActivity.Delta(cpuSeconds: 0.02, wallSeconds: 5)]
+        let generating = ScanPipeline.assemble(drafts: [draft, whisper], results: [:], manifests: [:], connections: [:], processes: [:],
+                                               cpuDeltas: swapping, selfPID: 1, gpuUtilization: 1.0).result
+        #expect(generating.runtimes.first { $0.pid == 300 }?.isBusy == true)
+        #expect(generating.runtimes.first { $0.pid == 920 }?.isBusy == false)
+        #expect(generating.models.filter { $0.runtime == .sdcpp }.allSatisfy { $0.state == ModelState.executing })
+        #expect(generating.models.filter { $0.runtime == .whisper }.allSatisfy { $0.state == ModelState.idle })
+        #expect(generating.runtimes.first { $0.pid == 920 }?.diagnostics?.candidate == false)
+        #expect(generating.runtimes.first { $0.pid == 920 }?.diagnostics?.decidedBy == "none")
 
         // Real-ESRGAN upscaling in another process at 100 % GPU while sd.cpp
-        // sits idle: two GPU candidates, so neither gets the GPU's credit.
-        let esrgan = ModelFile(path: "/Users/me/upscalers/RealESRGAN_x4plus.pth", sizeBytes: 64 * 1_048_576)
-        let app = Self.process(700, "Qwen Image", ClientResolutionTests.qwen, [ClientResolutionTests.qwen], kind: Classification(.unknown), files: [esrgan])
-        let upscaler = RuntimeDraft(kind: .unknown, process: app, helpers: [], probePort: nil)
-        let both: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.3, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 0.9, wallSeconds: 5)]
-        let shared = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
-                                           cpuDeltas: both, selfPID: 1, gpuUtilization: 1.0).result
-        #expect(shared.runtimes.allSatisfy { $0.isBusy == false })
-        #expect(shared.models.allSatisfy { $0.state == ModelState.idle })
-        #expect(shared.models.contains { $0.role == .upscaler && $0.runtime == .unknown })
+        // idles: the upscaler at 30 % of a core is busy by the CPU rule on
+        // its own merits and sd.cpp, out-ranked, stays idle.
+        let upscaler = Self.upscalerDraft()
+        let upscaling: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.05, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 1.5, wallSeconds: 5)]
+        let upscaled = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
+                                             cpuDeltas: upscaling, selfPID: 1, gpuUtilization: 1.0).result
+        #expect(upscaled.runtimes.first { $0.pid == 700 }?.isBusy == true)
+        #expect(upscaled.runtimes.first { $0.pid == 700 }?.diagnostics?.decidedBy == "cpu")
+        #expect(upscaled.runtimes.first { $0.pid == 300 }?.isBusy == false)
+        #expect(upscaled.models.filter { $0.runtime == .sdcpp }.allSatisfy { $0.state == ModelState.idle })
+        #expect(upscaled.models.contains { $0.role == .upscaler && $0.runtime == .unknown })
 
-        // The upscaler's CPU time crosses the quarter-core line: it is busy on its own merits.
-        let working: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.3, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 2, wallSeconds: 5)]
-        let upscaling = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
-                                              cpuDeltas: working, selfPID: 1, gpuUtilization: 1.0).result
-        #expect(upscaling.runtimes.first { $0.pid == 700 }?.isBusy == true)
-        #expect(upscaling.runtimes.first { $0.pid == 300 }?.isBusy == false)
+        // The upscaler under the quarter-core line but still 2× sd.cpp: it
+        // gets the GPU's credit, sd.cpp doesn't.
+        let lighter: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.05, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 0.5, wallSeconds: 5)]
+        let outranked = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
+                                              cpuDeltas: lighter, selfPID: 1, gpuUtilization: 1.0).result
+        #expect(outranked.runtimes.first { $0.pid == 700 }?.diagnostics?.decidedBy == "gpu")
+        #expect(outranked.runtimes.first { $0.pid == 300 }?.isBusy == false)
+
+        // Two GPU candidates within 2× of each other (0.02 and 0.015): neither.
+        let close: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.1, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 0.075, wallSeconds: 5)]
+        let undecided = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
+                                              cpuDeltas: close, selfPID: 1, gpuUtilization: 1.0).result
+        #expect(undecided.runtimes.allSatisfy { $0.isBusy == false })
+        #expect(undecided.runtimes.allSatisfy { $0.diagnostics?.candidate == true && $0.diagnostics?.decidedBy == "none" })
+        #expect(undecided.models.allSatisfy { $0.state == ModelState.idle })
 
         // An Ollama whose API answered doesn't count as a candidate.
         let ollama = Self.process(500, "ollama", "/opt/homebrew/bin/ollama", ["ollama", "serve"], kind: Classification(.ollama), ports: [11434])
@@ -860,6 +926,42 @@ struct ScanAssemblyTests {
         let withOllama = ScanPipeline.assemble(drafts: [draft, ollamaDraft], results: [500: known], manifests: [:], connections: [:], processes: [:],
                                                cpuDeltas: trickle, selfPID: 1, gpuUtilization: 0.96).result
         #expect(withOllama.runtimes.first { $0.pid == 300 }?.isBusy == true)
+        let answered = withOllama.runtimes.first { $0.pid == 500 }
+        #expect(answered?.diagnostics?.candidate == false)
+        #expect(answered?.diagnostics?.decidedBy == "api")
+        #expect(answered?.probeNote == "api answered")
+    }
+
+    @Test func candidatesAreGPUHoldersAndImageRuntimes() {
+        func model(_ device: Device, role: ModelRole = .text) -> LoadedModel {
+            LoadedModel(id: "1:x", name: "x", filePath: nil, runtime: .unknown, pid: 1, sizeBytes: 1, device: device,
+                        contextLength: nil, expiresAt: nil, state: .idle, role: role, clients: [], firstSeen: Date())
+        }
+        #expect(ScanPipeline.isGPUCandidate(kind: .whisper, models: [model(.unknown)]) == false)
+        #expect(ScanPipeline.isGPUCandidate(kind: .whisper, models: [model(.gpu)]) == true)
+        #expect(ScanPipeline.isGPUCandidate(kind: .llamaServer, models: [model(.cpu)]) == false)
+        #expect(ScanPipeline.isGPUCandidate(kind: .llamaServer, models: [model(.split)]) == true)
+        #expect(ScanPipeline.isGPUCandidate(kind: .ollama, models: []) == false)
+        #expect(ScanPipeline.isGPUCandidate(kind: .sdcpp, models: []) == true)
+        #expect(ScanPipeline.isGPUCandidate(kind: .mflux, models: [model(.unknown)]) == true)
+        #expect(ScanPipeline.isGPUCandidate(kind: .comfyUI, models: [model(.cpu)]) == true)
+        #expect(ScanPipeline.isGPUCandidate(kind: .unknown, models: [model(.unknown, role: .upscaler)]) == true)
+        #expect(ScanPipeline.isGPUCandidate(kind: .unknown, models: [model(.unknown, role: .text)]) == false)
+    }
+
+    @Test func theProbeNoteSaysHowTheProbeWent() {
+        #expect(ScanPipeline.probeNote(for: Self.sdDraft(), probe: .nothing, previous: [:]) == "no api")
+        #expect(ScanPipeline.probeNote(for: Self.whisperDraft(), probe: .nothing, previous: [:]) == "no api")
+        let llama = Self.process(400, "llama-server", "/opt/homebrew/bin/llama-server", ["llama-server", "-m", "x.gguf"],
+                                 kind: Classification(.llamaServer), ports: [8080])
+        let listening = RuntimeDraft(kind: .llamaServer, process: llama, helpers: [], probePort: 8080)
+        let silent = RuntimeDraft(kind: .llamaServer, process: llama, helpers: [], probePort: nil)
+        let remembered = LoadedModel(id: "400:a", name: "a", filePath: nil, runtime: .llamaServer, pid: 400, sizeBytes: 1, device: .gpu,
+                                     contextLength: nil, expiresAt: nil, state: .idle, role: .text, clients: [], firstSeen: Date())
+        #expect(ScanPipeline.probeNote(for: listening, probe: ProbeResult(version: "b1", isBusy: false, models: [], apiAnswered: true), previous: [:]) == "api answered")
+        #expect(ScanPipeline.probeNote(for: listening, probe: .nothing, previous: [:]) == "api timed out")
+        #expect(ScanPipeline.probeNote(for: listening, probe: .nothing, previous: ["400:a": remembered]) == "api timed out, carried over")
+        #expect(ScanPipeline.probeNote(for: silent, probe: .nothing, previous: [:]) == "no port")
     }
 
     @Test func ollamaWithNoModelsIsStillARuntime() {

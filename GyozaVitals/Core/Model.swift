@@ -55,6 +55,25 @@ nonisolated struct RuntimeInstance: Identifiable, Hashable, Sendable {
     var isBusy: Bool?
     /// Processes connected to this runtime's ports.
     var clients: [ClientApp]
+    /// What the busy heuristic saw for this runtime this scan; nil before
+    /// the scanner has run (fixtures, a static store).
+    var diagnostics: BusyDiagnostics? = nil
+    /// How the probe went: "api answered", "api timed out, carried over",
+    /// "no api", "no port".
+    var probeNote: String? = nil
+}
+
+/// The inputs and the outcome of the busy heuristic for one runtime, shown
+/// in Settings so a missing or wrong red dot can be read off a screenshot.
+nonisolated struct BusyDiagnostics: Hashable, Sendable {
+    /// The runtime's share of one core since the last scan; nil on its first scan.
+    var cpuShare: Double?
+    /// The system GPU utilisation handed to the scanner; nil when the OS doesn't report it.
+    var gpuUtilization: Double?
+    /// True when the GPU could have been credited to this runtime.
+    var candidate: Bool
+    /// "api", "cpu", "gpu", "none" or "first scan".
+    var decidedBy: String
 }
 
 /// What a model file is for, guessed from its name and the runtime.

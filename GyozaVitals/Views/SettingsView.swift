@@ -1,9 +1,18 @@
 import SwiftUI
 
 /// Settings: a grouped Form on the canvas, 520 pt wide. Menu bar content,
-/// refresh rates, the runtimes to watch with their ports, open at login.
+/// refresh rates, the runtimes to watch with their ports, open at login, and
+/// a diagnostics section showing what the busy heuristic saw per runtime.
 struct SettingsView: View {
     @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var store: VitalsStore
+    /// The window's height; the snapshot test passes the Form's full
+    /// content height so the diagnostics lines can be reviewed.
+    let height: CGFloat
+
+    init(height: CGFloat = Theme.Layout.settingsHeight) {
+        self.height = height
+    }
 
     private static let runtimes: [RuntimeKind] = RuntimeKind.allCases.filter { $0 != .appleIntelligence && $0 != .unknown }
 
@@ -59,11 +68,46 @@ struct SettingsView: View {
                     .font(Theme.Typeface.meta)
                     .foregroundStyle(Theme.inkSecondary)
             }
+
+            Section {
+                ForEach(store.runtimes) { runtime in
+                    DiagnosticsLine(text: Self.diagnosticsLine(runtime))
+                }
+                DiagnosticsLine(text: Self.scanLine(lastScan: store.lastScan, modelCount: store.models.count))
+            } header: {
+                Text("Diagnostics").labelStyle()
+            } footer: {
+                Text("What the busy heuristic sees. Share a screenshot of this when a red dot is missing or wrong.")
+                    .font(Theme.Typeface.meta)
+                    .foregroundStyle(Theme.inkSecondary)
+            }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .background(Theme.canvas)
-        .frame(width: Theme.Layout.settingsWidth, height: Theme.Layout.settingsHeight)
+        .frame(width: Theme.Layout.settingsWidth, height: height)
+    }
+
+    private static let dash = "\u{2013}"
+
+    /// "sd.cpp pid 1234 · api: no api · cpu 0.012 · gpu 1.00 · candidate · decided by gpu".
+    static func diagnosticsLine(_ runtime: RuntimeInstance) -> String {
+        let d = runtime.diagnostics
+        let candidate = d.map { $0.candidate ? "candidate" : "not a candidate" } ?? "candidate \(dash)"
+        return [
+            "\(runtime.kind.displayName) pid \(runtime.pid)",
+            "api: \(runtime.probeNote ?? dash)",
+            "cpu \(Formatting.fraction(d?.cpuShare, decimals: 3))",
+            "gpu \(Formatting.fraction(d?.gpuUtilization, decimals: 2))",
+            candidate,
+            "decided by \(d?.decidedBy ?? dash)",
+        ].joined(separator: " · ")
+    }
+
+    /// "last scan 14:02:37 · 5 models".
+    static func scanLine(lastScan: Date?, modelCount: Int) -> String {
+        let when = lastScan.map(Formatting.clockWithSeconds) ?? dash
+        return "last scan \(when) · \(modelCount) \(modelCount == 1 ? "model" : "models")"
     }
 
     private func watched(_ kind: RuntimeKind) -> Binding<Bool> {
@@ -101,5 +145,19 @@ private struct RuntimeRow: View {
                     .accessibilityLabel("\(kind.displayName) port")
             }
         }
+    }
+}
+
+/// One mono line of the diagnostics section; wraps rather than truncates.
+private struct DiagnosticsLine: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(Theme.Typeface.mono)
+            .foregroundStyle(Theme.inkSecondary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

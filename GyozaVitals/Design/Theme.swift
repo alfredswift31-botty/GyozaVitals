@@ -119,7 +119,9 @@ enum Theme {
     enum Layout {
         static let popoverWidth: CGFloat = 340
         static let settingsWidth: CGFloat = 520
-        static let settingsHeight: CGFloat = 700
+        /// Tall enough for the four settings sections on a 13-inch display;
+        /// the diagnostics section below them scrolls into view.
+        static let settingsHeight: CGFloat = 860
         /// Label-over-value column: four to a row. The memory legend is four
         /// of these (APP / WIRED / COMPR. / FREE), filling the 308 pt content column.
         static let column: CGFloat = 77

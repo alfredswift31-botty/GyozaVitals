@@ -34,4 +34,20 @@ nonisolated enum Formatting {
     static func clock(_ date: Date) -> String {
         date.formatted(date: .omitted, time: .shortened)
     }
+
+    /// "14:02:37" for the diagnostics pane.
+    static func clockWithSeconds(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    /// A 0...1 fraction to a fixed number of decimals ("0.012", "1.00"),
+    /// or an en dash for nil: the diagnostics pane never shows a 0 that
+    /// means "unknown".
+    static func fraction(_ value: Double?, decimals: Int) -> String {
+        guard let value else { return "\u{2013}" }
+        return String(format: "%.\(decimals)f", value)
+    }
 }

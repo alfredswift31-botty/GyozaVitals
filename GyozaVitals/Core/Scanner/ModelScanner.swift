@@ -192,24 +192,37 @@ actor ScanPipeline {
             probes[draft.process.pid] = probe
             resident[draft.process.pid] = probe.apiAnswered ? probe.models : carryOver(probe.models, in: draft, previous: previous, now: now)
         }
-        // GPU-using runtimes whose busy state no API gave: the GPU is credited
-        // to one of them only when it is the only one (see CPUActivity).
-        let gpuCandidates = drafts.filter { probes[$0.process.pid]?.isBusy == nil && usesGPU(resident[$0.process.pid] ?? []) }.count
+        // The heuristic's inputs, before anything is decided: each runtime's
+        // CPU share, and which of those without an API answer could be
+        // credited with the GPU (see CPUActivity.gpuCredit).
+        var shares: [pid_t: Double?] = [:]
+        var candidates: [pid_t: Double?] = [:]
+        for draft in drafts {
+            let pid = draft.process.pid
+            shares[pid] = CPUActivity.share(deltas: draft.pids.compactMap { cpuDeltas[$0] })
+            if probes[pid]?.isBusy == nil, isGPUCandidate(kind: draft.kind, models: resident[pid] ?? []) {
+                candidates.updateValue(shares[pid] ?? nil, forKey: pid)
+            }
+        }
+        let credited = CPUActivity.gpuCredit(gpuUtilization: gpuUtilization, candidates: candidates)
 
         for draft in drafts {
             let pid = draft.process.pid
             let probe = probes[pid] ?? .nothing
             let clients = Self.clients(for: draft, connections: connections, processes: byPID,
                                        excluding: draft.pids.union([selfPID]), chains: &chains)
+            let share = shares[pid] ?? nil
+            let candidate = candidates[pid] != nil
 
             // No answer from an API: the CPU/GPU heuristic decides, and a busy
             // runtime's resident models are executing. Loading stays loading.
             var isBusy = probe.isBusy
+            var decidedBy = "api"
             var probedModels = resident[pid] ?? []
             if isBusy == nil {
-                let share = CPUActivity.share(deltas: draft.pids.compactMap { cpuDeltas[$0] })
-                isBusy = CPUActivity.busy(cpuShare: share, gpuUtilization: gpuUtilization,
-                                          gpuCandidates: usesGPU(probedModels) ? gpuCandidates : 0)
+                let verdict = CPUActivity.verdict(cpuShare: share, gpuUtilization: gpuUtilization, gpuCredited: credited == pid)
+                isBusy = verdict.isBusy
+                decidedBy = verdict.decidedBy
                 if isBusy == true {
                     probedModels = probedModels.map { model in
                         var model = model
@@ -225,7 +238,9 @@ actor ScanPipeline {
             runtimes.append(RuntimeInstance(
                 pid: pid, kind: draft.kind, processName: draft.process.record.name,
                 executablePath: draft.process.record.executablePath, listeningPorts: draft.process.listeningPorts,
-                version: probe.version, footprintBytes: draft.footprintBytes, isBusy: isBusy, clients: clients))
+                version: probe.version, footprintBytes: draft.footprintBytes, isBusy: isBusy, clients: clients,
+                diagnostics: BusyDiagnostics(cpuShare: share, gpuUtilization: gpuUtilization, candidate: candidate, decidedBy: decidedBy),
+                probeNote: probeNote(for: draft, probe: probe, previous: previous)))
             models += probedModels.map { model in
                 var model = model
                 model.clients = clients
@@ -238,9 +253,30 @@ actor ScanPipeline {
                               clientChains: chains, apiModels: apiModels)
     }
 
-    /// A runtime that holds weights on the GPU (or where we can't tell).
-    static func usesGPU(_ models: [LoadedModel]) -> Bool {
-        models.contains { $0.device != .cpu }
+    /// A runtime the busy GPU could belong to: one that holds weights on the
+    /// GPU (or split), or an image runtime whatever its files say (sd.cpp,
+    /// mflux, ComfyUI, an unclassified process holding an upscaler). A
+    /// whisper whose model device is unknown is not one: it holds nothing
+    /// the GPU would be working on, and the CPU rule still covers it.
+    static func isGPUCandidate(kind: RuntimeKind, models: [LoadedModel]) -> Bool {
+        if models.contains(where: { $0.device == .gpu || $0.device == .split }) { return true }
+        switch kind {
+        case .sdcpp, .mflux, .comfyUI: return true
+        case .unknown: return models.contains { $0.role == .upscaler }
+        case .ollama, .llamaServer, .koboldcpp, .lmStudio, .whisper, .appleIntelligence: return false
+        }
+    }
+
+    /// One phrase on how the probe went, for the diagnostics pane.
+    static func probeNote(for draft: RuntimeDraft, probe: ProbeResult, previous: [String: LoadedModel]) -> String {
+        if probe.apiAnswered { return "api answered" }
+        switch draft.kind {
+        case .sdcpp, .mflux, .unknown, .appleIntelligence, .whisper: return "no api"
+        case .ollama, .llamaServer, .koboldcpp, .lmStudio, .comfyUI: break
+        }
+        guard draft.probePort != nil else { return "no port" }
+        let pid = draft.process.pid
+        return previous.values.contains { $0.pid == pid } ? "api timed out, carried over" : "api timed out"
     }
 
     // MARK: Carry-over

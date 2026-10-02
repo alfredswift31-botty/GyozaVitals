@@ -162,16 +162,20 @@ nonisolated enum FileProbe {
 // MARK: - CPU-time heuristic
 
 /// Whether a runtime with no API to ask is working, from its CPU time and
-/// the system GPU: a process using more than a quarter of one core, averaged
-/// over the scan interval, is executing. Metal-bound generation (sd.cpp at
-/// 96 % GPU) can stay well under that on the CPU, so a second rule credits
-/// the GPU to a runtime when the GPU is busy (≥ 80 %), the runtime shows at
-/// least a trickle of CPU (≥ 3 % of a core: a process encoding command
-/// buffers is never fully asleep), and it is the only GPU-using runtime
-/// whose busy state the APIs can't give. The last condition is the
+/// the system GPU. A process using more than a quarter of one core,
+/// averaged over the scan interval, is executing. Metal-bound generation
+/// (sd.cpp at 100 % GPU, swapping) can sit at a hundredth of a core, so a
+/// second rule credits a busy GPU (≥ 80 %) to one runtime: among the
+/// candidates (runtimes whose busy state no API gave and that hold GPU
+/// weights or generate images), the one with the highest CPU share, provided
+/// it shows at least half a percent of a core and out-ranks the next
+/// candidate two to one (or is the only one). A process encoding command
+/// buffers is never fully asleep, so the floor separates a model runtime
+/// from a GPU owned by a game or a video. The two-to-one margin is the
 /// false-positive guard: with Real-ESRGAN upscaling in another process at
-/// 100 % GPU while sd.cpp sat idle, two candidates share the GPU and neither
-/// is credited; the CPU rule alone decides for both.
+/// 100 % GPU while sd.cpp sat idle, the upscaler out-ranks sd.cpp and gets
+/// the credit (or crosses the quarter-core line on its own); two candidates
+/// within a factor of two of each other leave the GPU uncredited.
 ///
 /// Samples are kept per (pid, start time) across scans; the first scan of a
 /// process answers nil. Only `isBusy == nil` from a probe is replaced.
@@ -191,15 +195,25 @@ nonisolated struct CPUActivity: Sendable {
         let wallSeconds: Double
     }
 
+    /// The outcome for one runtime: busy, idle or unknown, and which rule said so.
+    nonisolated struct Verdict: Hashable, Sendable {
+        let isBusy: Bool?
+        /// "cpu", "gpu", "none" or "first scan".
+        let decidedBy: String
+    }
+
     /// Above this share of one core the process counts as busy.
     static let busyCoreFraction = 0.25
     /// Below this many seconds between samples the ratio is noise.
     static let minimumInterval = 0.05
     /// The system GPU is busy at or above this utilisation.
     static let busyGPUFraction = 0.8
-    /// A GPU-bound runtime still shows at least this share of a core; below
-    /// it the GPU belongs to something that holds no model (a game, a video).
-    static let gpuCompanionCoreFraction = 0.03
+    /// A runtime driving the GPU still shows at least this share of a core;
+    /// below it the GPU belongs to something that holds no model.
+    static let gpuCompanionCoreFraction = 0.005
+    /// The GPU goes to the top candidate only when its share is at least
+    /// this many times the next one's.
+    static let gpuLeadFactor = 2.0
 
     private var samples: [Key: Sample] = [:]
 
@@ -224,29 +238,48 @@ nonisolated struct CPUActivity: Sendable {
 
     /// Busy, idle, or unknown when the interval is too short to say.
     static func busy(cpuDelta: Double, wallDelta: Double) -> Bool? {
-        busy(cpuShare: share(cpuDelta: cpuDelta, wallDelta: wallDelta), gpuUtilization: nil, gpuCandidates: 0)
+        busy(cpuShare: share(cpuDelta: cpuDelta, wallDelta: wallDelta), gpuUtilization: nil, gpuCredited: false)
     }
 
     /// The verdict for a group of processes, CPU time alone.
     static func busy(deltas: [Delta]) -> Bool? {
-        busy(cpuShare: share(deltas: deltas), gpuUtilization: nil, gpuCandidates: 0)
+        busy(cpuShare: share(deltas: deltas), gpuUtilization: nil, gpuCredited: false)
+    }
+
+    /// Which candidate the GPU is credited to, by pid: the highest CPU
+    /// share, when it clears `gpuCompanionCoreFraction` and leads the next
+    /// candidate by `gpuLeadFactor`. Nil when the GPU isn't busy (or isn't
+    /// reported), no candidate has a share yet, or none stands out.
+    /// Candidates without a share (their first scan) can't be ranked and
+    /// are left out; the next scan has them.
+    static func gpuCredit(gpuUtilization: Double?, candidates: [pid_t: Double?]) -> pid_t? {
+        guard let gpuUtilization, gpuUtilization >= busyGPUFraction else { return nil }
+        let ranked = candidates.compactMap { pid, share in share.map { (pid: pid, share: $0) } }
+            .sorted { ($0.share, $1.pid) > ($1.share, $0.pid) }
+        guard let top = ranked.first, top.share >= gpuCompanionCoreFraction else { return nil }
+        if let next = ranked.dropFirst().first, top.share < next.share * gpuLeadFactor { return nil }
+        return top.pid
     }
 
     /// The combined rule. `cpuShare` is the runtime's share of one core since
     /// the last scan (nil: no sample yet, so unknown). `gpuUtilization` is the
-    /// system's (nil when the OS doesn't report it). `gpuCandidates` counts
-    /// the runtimes that use the GPU and whose busy state no API gave, this
-    /// one included; the GPU is credited only when it is the single one.
+    /// system's (nil when the OS doesn't report it). `gpuCredited` says
+    /// `gpuCredit` picked this runtime.
     ///
     ///   busy = cpuShare > 0.25
-    ///       || (gpu ≥ 0.8 && cpuShare ≥ 0.03 && gpuCandidates == 1)
-    static func busy(cpuShare: Double?, gpuUtilization: Double?, gpuCandidates: Int) -> Bool? {
-        guard let cpuShare else { return nil }
-        if cpuShare > busyCoreFraction { return true }
-        if let gpuUtilization, gpuUtilization >= busyGPUFraction, cpuShare >= gpuCompanionCoreFraction, gpuCandidates == 1 {
-            return true
+    ///       || (gpu ≥ 0.8 && gpuCredited)
+    static func busy(cpuShare: Double?, gpuUtilization: Double?, gpuCredited: Bool) -> Bool? {
+        verdict(cpuShare: cpuShare, gpuUtilization: gpuUtilization, gpuCredited: gpuCredited).isBusy
+    }
+
+    /// The combined rule with its reason.
+    static func verdict(cpuShare: Double?, gpuUtilization: Double?, gpuCredited: Bool) -> Verdict {
+        guard let cpuShare else { return Verdict(isBusy: nil, decidedBy: "first scan") }
+        if cpuShare > busyCoreFraction { return Verdict(isBusy: true, decidedBy: "cpu") }
+        if gpuCredited, let gpuUtilization, gpuUtilization >= busyGPUFraction {
+            return Verdict(isBusy: true, decidedBy: "gpu")
         }
-        return false
+        return Verdict(isBusy: false, decidedBy: "none")
     }
 
     /// Records this scan's readings and returns, per pid, the change since
