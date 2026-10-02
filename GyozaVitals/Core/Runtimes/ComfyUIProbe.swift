@@ -59,6 +59,6 @@ nonisolated enum ComfyUIProbe {
         // On Apple silicon ComfyUI runs on MPS unless told otherwise.
         let device = stats?.device ?? (draft.process.record.arguments.contains("--cpu") ? .cpu : .gpu)
         let models = set.models(runtime: .comfyUI, pid: draft.process.pid, device: device, state: isBusy == true ? .executing : .idle)
-        return ProbeResult(version: stats?.version, isBusy: isBusy, models: models)
+        return ProbeResult(version: stats?.version, isBusy: isBusy, models: models, apiAnswered: stats != nil || queue != nil)
     }
 }

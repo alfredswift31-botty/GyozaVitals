@@ -24,7 +24,7 @@ nonisolated enum ModelFiles {
         let ext = (name as NSString).pathExtension
         if extensions.contains(ext) { return true }
         if ext == "bin" {
-            return name.hasPrefix("ggml-") || path.contains(".mlmodelc/") || name.contains("whisper")
+            return name.hasPrefix("ggml-") || path.contains(".mlmodelc/") || name.contains("whisper") || ModelRoles.isUpscalerName(name)
         }
         return false
     }
@@ -55,16 +55,30 @@ nonisolated enum ModelFiles {
         return String(cString: real)
     }
 
-    /// Model files among a process's mapped and open paths.
-    static func files(amongPaths paths: [String], minimumBytes: UInt64) -> [ModelFile] {
+    /// Model files among a process's mapped and open paths, at least
+    /// `minimumBytes` large. Upscalers and face restorers (Real-ESRGAN,
+    /// GFPGAN, CodeFormer: 17–70 MB) are small for weights, so a file whose
+    /// name says it is one passes at `upscalerMinimumBytes` instead.
+    static func files(amongPaths paths: [String], minimumBytes: UInt64, upscalerMinimumBytes: UInt64? = nil) -> [ModelFile] {
         var seen = Set<String>()
         var files: [ModelFile] = []
         for path in paths where isModelPath(path) {
             let resolved = resolve(path, cwd: nil)
-            guard seen.insert(resolved).inserted, let size = size(ofFile: resolved), size >= minimumBytes else { continue }
+            guard seen.insert(resolved).inserted, let size = size(ofFile: resolved) else { continue }
+            guard size >= sizeFloor(forPath: resolved, minimumBytes: minimumBytes, upscalerMinimumBytes: upscalerMinimumBytes) else { continue }
             files.append(ModelFile(path: resolved, sizeBytes: size))
         }
         return files
+    }
+
+    /// The size a file must reach to count: the upscaler floor when the
+    /// name says upscaler and that floor is lower, else the general one.
+    static func sizeFloor(forPath path: String, minimumBytes: UInt64, upscalerMinimumBytes: UInt64?) -> UInt64 {
+        guard let upscalerMinimumBytes, upscalerMinimumBytes < minimumBytes else { return minimumBytes }
+        let name = (path as NSString).lastPathComponent
+        let ext = (name as NSString).pathExtension.lowercased()
+        guard ["pth", "pt", "ckpt", "safetensors", "gguf", "bin"].contains(ext), ModelRoles.isUpscalerName(name) else { return minimumBytes }
+        return upscalerMinimumBytes
     }
 
     // MARK: argv
@@ -127,14 +141,23 @@ nonisolated enum ModelRoles {
     static func imageRole(_ name: String) -> ModelRole {
         if name.contains("mmproj") { return .projector }
         if name.contains("vae") || name.hasPrefix("ae.") { return .vae }
-        if name.contains("esrgan") || name.contains("upscale") || name.contains("ultrasharp") || name.hasPrefix("4x") || name.hasPrefix("2x") {
-            return .upscaler
-        }
+        if isUpscalerName(name) || name.contains("ultrasharp") { return .upscaler }
         if name.contains("text_encoder") || name.contains("textencoder") || name.contains("clip") || name.contains("t5")
             || name.contains("llava") || name.contains("umt5") || isVisionName(name) {
             return .imageEncoder
         }
         return .image
+    }
+
+    /// "RealESRGAN_x4plus", "realesr-general-x4v3", "4x-UltraSharp", "GFPGANv1.4",
+    /// "codeformer", "upscaler": a model that enlarges or restores images. The scale
+    /// tokens count only at the start of a word ("4x_foo", "4xNMKD"), so
+    /// "1024x1024" in a name is not one.
+    static func isUpscalerName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        if ["esrgan", "realesr", "upscal", "gfpgan", "codeformer"].contains(where: { lower.contains($0) }) { return true }
+        let words = lower.split { !$0.isLetter && !$0.isNumber }
+        return words.contains { $0.hasPrefix("4x") || $0.hasPrefix("2x") }
     }
 
     /// "qwen3-vl", "Qwen2.5VL", "llava", "vision", "joycaption": a model that sees.

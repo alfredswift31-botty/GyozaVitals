@@ -85,7 +85,8 @@ nonisolated enum KoboldProbe {
             models[index].contextLength = maxContext
             if let modelName, !modelName.isEmpty, modelName != "protected-model" { models[index].name = modelName }
         }
-        return ProbeResult(version: version?.version, isBusy: isBusy, models: models)
+        return ProbeResult(version: version?.version, isBusy: isBusy, models: models,
+                           apiAnswered: version != nil || perf != nil || modelName != nil)
     }
 
     /// The first bare argument that names a weights file and isn't the value

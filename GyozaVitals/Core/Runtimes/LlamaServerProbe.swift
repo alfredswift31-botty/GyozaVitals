@@ -105,6 +105,7 @@ nonisolated enum LlamaServerProbe {
                 models[index].name = alias
             }
         }
-        return ProbeResult(version: props?.buildInfo, isBusy: isLoading ? true : isBusy, models: models)
+        return ProbeResult(version: props?.buildInfo, isBusy: isLoading ? true : isBusy, models: models,
+                           apiAnswered: props != nil || slots != nil || healthStatus != nil)
     }
 }
