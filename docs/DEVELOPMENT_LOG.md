@@ -100,6 +100,20 @@ First screenshot of the pane, mid-generation: `sd.cpp · api: no api · cpu 0.00
 
 Also confirmed by the 1.0.2 prompt-helper screenshot: one Ollama row, a live unload countdown, no "loading", "used by Qwen Image".
 
+## Where things stand (end of 2 Oct 2026)
+**Origin.** GyozaVitals was #4 on a list of twelve project ideas built from the models already on the user's Mac (see `docs/PROJECT-IDEAS.md` in the GyozaIsland repo). It was picked first because it is small and because every other local-model project on the list would hit the same RAM collisions it makes visible.
+
+**Verified on the user's 16 GB Mac (macOS 27):** models from sd.cpp, whisper.cpp and Ollama with correct names, sizes and devices; "used by" collapsed to the app name; one row per Ollama model with a live unload countdown; the memory bar and legend; "models resident"; headroom; pressure history; CPU with P/E split; GPU; thermal; power; the activity log seeded silently; the menu-bar glyph and number; the red dot on sd.cpp during a Metal generation (1.0.4); the Diagnostics pane.
+
+**Not yet seen working:** Ollama's own red dot while a request runs (same heuristic, untested on a real run); koboldcpp, llama-server, LM Studio, ComfyUI and mflux detection (none running on the user's Mac that day); energy use over an hour; the P/E-core index assumption.
+
+**Lessons.**
+- The first real run found what no test could: the user's image app runs sd.cpp, not ComfyUI; Ollama's API names a model by its manifest digest while the runner holds the layer digest; helper processes own the sockets, not the app.
+- A heuristic tuned from outside the app is a guess. The busy rule took three releases until the Diagnostics pane showed the actual number (0.004 against a 0.005 floor). Instrument first, then tune.
+- Read-only was the right call for 1.0: the app ran beside a two-hour generation on a swapping machine and never got in its way.
+
+**1.1 candidates, in order of value:** unload buttons behind a confirmation (Ollama `keep_alive: 0`); a notification when pressure goes critical while a model is executing; a 1024 px icon source; per-model attribution for Ollama once its API exposes it; SMC fans and watts.
+
 ## Working notes
 - Work goes on `develop`; releases come from `main`.
 - To release: run Actions › Build › Run workflow on `main` with `release_tag: vX.Y.Z`.
