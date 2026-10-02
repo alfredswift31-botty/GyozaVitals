@@ -48,6 +48,10 @@ nonisolated struct ProbeResult: Sendable {
     var version: String?
     var isBusy: Bool?
     var models: [LoadedModel]
+    /// True when the runtime's own API described its models. False for the
+    /// file fallback, a probe that timed out, or a runtime with no API: the
+    /// pipeline then carries over what the API said last time.
+    var apiAnswered: Bool = false
 
     static let nothing = ProbeResult(version: nil, isBusy: nil, models: [])
 }
@@ -157,10 +161,17 @@ nonisolated enum FileProbe {
 
 // MARK: - CPU-time heuristic
 
-/// Whether a runtime with no API to ask is working, from its CPU time: a
-/// process using more than a quarter of one core, averaged over the scan
-/// interval, is executing. Metal work still keeps a core busy encoding
-/// command buffers, so this holds for GPU-bound inference too.
+/// Whether a runtime with no API to ask is working, from its CPU time and
+/// the system GPU: a process using more than a quarter of one core, averaged
+/// over the scan interval, is executing. Metal-bound generation (sd.cpp at
+/// 96 % GPU) can stay well under that on the CPU, so a second rule credits
+/// the GPU to a runtime when the GPU is busy (≥ 80 %), the runtime shows at
+/// least a trickle of CPU (≥ 3 % of a core: a process encoding command
+/// buffers is never fully asleep), and it is the only GPU-using runtime
+/// whose busy state the APIs can't give. The last condition is the
+/// false-positive guard: with Real-ESRGAN upscaling in another process at
+/// 100 % GPU while sd.cpp sat idle, two candidates share the GPU and neither
+/// is credited; the CPU rule alone decides for both.
 ///
 /// Samples are kept per (pid, start time) across scans; the first scan of a
 /// process answers nil. Only `isBusy == nil` from a probe is replaced.
@@ -184,25 +195,58 @@ nonisolated struct CPUActivity: Sendable {
     static let busyCoreFraction = 0.25
     /// Below this many seconds between samples the ratio is noise.
     static let minimumInterval = 0.05
+    /// The system GPU is busy at or above this utilisation.
+    static let busyGPUFraction = 0.8
+    /// A GPU-bound runtime still shows at least this share of a core; below
+    /// it the GPU belongs to something that holds no model (a game, a video).
+    static let gpuCompanionCoreFraction = 0.03
 
     private var samples: [Key: Sample] = [:]
 
     init() {}
 
-    /// Busy, idle, or unknown when the interval is too short to say.
-    static func busy(cpuDelta: Double, wallDelta: Double) -> Bool? {
+    /// The share of one core, or nil when the interval is too short to say
+    /// or the counter went backwards.
+    static func share(cpuDelta: Double, wallDelta: Double) -> Double? {
         guard wallDelta >= minimumInterval, cpuDelta.isFinite, cpuDelta >= 0 else { return nil }
-        return cpuDelta / wallDelta > busyCoreFraction
+        return cpuDelta / wallDelta
     }
 
-    /// The verdict for a group of processes (a runtime and its helpers):
-    /// their CPU time added up over the longest interval any of them has.
-    /// Nil when none has a previous sample.
-    static func busy(deltas: [Delta]) -> Bool? {
+    /// A group of processes (a runtime and its helpers): their CPU time
+    /// added up over the longest interval any of them has. Nil when none has
+    /// a previous sample.
+    static func share(deltas: [Delta]) -> Double? {
         guard !deltas.isEmpty else { return nil }
         let cpu = deltas.reduce(0) { $0 + $1.cpuSeconds }
         let wall = deltas.map(\.wallSeconds).max() ?? 0
-        return busy(cpuDelta: cpu, wallDelta: wall)
+        return share(cpuDelta: cpu, wallDelta: wall)
+    }
+
+    /// Busy, idle, or unknown when the interval is too short to say.
+    static func busy(cpuDelta: Double, wallDelta: Double) -> Bool? {
+        busy(cpuShare: share(cpuDelta: cpuDelta, wallDelta: wallDelta), gpuUtilization: nil, gpuCandidates: 0)
+    }
+
+    /// The verdict for a group of processes, CPU time alone.
+    static func busy(deltas: [Delta]) -> Bool? {
+        busy(cpuShare: share(deltas: deltas), gpuUtilization: nil, gpuCandidates: 0)
+    }
+
+    /// The combined rule. `cpuShare` is the runtime's share of one core since
+    /// the last scan (nil: no sample yet, so unknown). `gpuUtilization` is the
+    /// system's (nil when the OS doesn't report it). `gpuCandidates` counts
+    /// the runtimes that use the GPU and whose busy state no API gave, this
+    /// one included; the GPU is credited only when it is the single one.
+    ///
+    ///   busy = cpuShare > 0.25
+    ///       || (gpu ≥ 0.8 && cpuShare ≥ 0.03 && gpuCandidates == 1)
+    static func busy(cpuShare: Double?, gpuUtilization: Double?, gpuCandidates: Int) -> Bool? {
+        guard let cpuShare else { return nil }
+        if cpuShare > busyCoreFraction { return true }
+        if let gpuUtilization, gpuUtilization >= busyGPUFraction, cpuShare >= gpuCompanionCoreFraction, gpuCandidates == 1 {
+            return true
+        }
+        return false
     }
 
     /// Records this scan's readings and returns, per pid, the change since
@@ -230,4 +274,7 @@ nonisolated struct CPUActivity: Sendable {
 nonisolated struct PipelineOutput: Sendable {
     var result: ScanResult
     var clientChains: [pid_t: [ProcessChainLink]]
+    /// Models whose fields came from a runtime API this scan (or were carried
+    /// over from one), by id: next scan's fallback when that API is slow.
+    var apiModels: [String: LoadedModel] = [:]
 }

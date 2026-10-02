@@ -208,4 +208,12 @@ protocol SystemMetricsSource: AnyObject {
 /// runtime probes; faked by tests.
 protocol ModelScanSource: AnyObject {
     func scan(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult
+    /// The latest system GPU utilisation (0...1, nil when the OS doesn't
+    /// report it), handed over before each scan so the busy heuristic can
+    /// use it. Optional: the default does nothing.
+    func noteSystemGPU(utilization: Double?)
+}
+
+extension ModelScanSource {
+    func noteSystemGPU(utilization: Double?) {}
 }

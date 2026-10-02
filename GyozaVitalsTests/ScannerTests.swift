@@ -644,6 +644,32 @@ struct CPUActivityTests {
         #expect(CPUActivity.busy(cpuDelta: cpu, wallDelta: wall) == expected)
     }
 
+    /// (cpu share of a core, system GPU, GPU candidates) → busy / idle / unknown.
+    static let combinedCases: [(Double?, Double?, Int, Bool?)] = [
+        (nil, 0.96, 1, nil), // no CPU sample yet: unknown, whatever the GPU says
+        (0.30, nil, 0, true), // the CPU rule alone
+        (0.10, nil, 0, false),
+        (0.10, 0.96, 1, true), // Metal-bound sd.cpp: the only GPU candidate is credited
+        (0.10, 0.96, 2, false), // the upscaler case: two candidates share the GPU, neither is credited
+        (0.10, 0.96, 0, false), // not a GPU user at all
+        (0.02, 0.96, 1, false), // under the companion floor: a game or a video owns the GPU
+        (0.10, 0.50, 1, false), // GPU not busy
+        (0.03, 0.80, 1, true), // both floors are inclusive
+        (0.26, 0.0, 2, true), // the CPU rule wins regardless of candidates
+        (0.26, nil, 0, true),
+    ]
+
+    @Test(arguments: CPUActivityTests.combinedCases) func busyFromCPUAndGPU(share: Double?, gpu: Double?, candidates: Int, expected: Bool?) {
+        #expect(CPUActivity.busy(cpuShare: share, gpuUtilization: gpu, gpuCandidates: candidates) == expected)
+    }
+
+    @Test func shareIsCPUOverWall() {
+        #expect(CPUActivity.share(cpuDelta: 1, wallDelta: 4) == 0.25)
+        #expect(CPUActivity.share(cpuDelta: 1, wallDelta: 0.01) == nil)
+        #expect(CPUActivity.share(deltas: []) == nil)
+        #expect(CPUActivity.share(deltas: [CPUActivity.Delta(cpuSeconds: 1, wallSeconds: 5), CPUActivity.Delta(cpuSeconds: 1, wallSeconds: 4)]) == 0.4)
+    }
+
     @Test func groupsAddCPUOverTheLongestInterval() {
         #expect(CPUActivity.busy(deltas: []) == nil)
         let quiet = CPUActivity.Delta(cpuSeconds: 0.2, wallSeconds: 5)
@@ -776,11 +802,64 @@ struct ScanAssemblyTests {
         #expect(answered.runtimes.first?.isBusy == false, "the API said idle; CPU time does not override it")
         #expect(answered.models.first?.state == .idle)
 
+        // The process started 5 s ago: a silent API and "loading" is believable.
+        let young = Date(timeIntervalSince1970: 1_790_000_005)
         let silent = ScanPipeline.assemble(
             drafts: [draft], results: [400: ProbeResult(version: nil, isBusy: nil, models: [model("a", .idle), model("b", .loading)])],
-            manifests: [:], connections: [:], processes: [:], cpuDeltas: working, selfPID: 1).result
+            manifests: [:], connections: [:], processes: [:], cpuDeltas: working, selfPID: 1, now: young).result
         #expect(silent.runtimes.first?.isBusy == true)
         #expect(silent.models.map(\.state) == [ModelState.executing, ModelState.loading], "idle becomes executing; loading stays")
+
+        // A minute old and not answering: it is working or idle, never still loading.
+        let old = Date(timeIntervalSince1970: 1_790_000_060)
+        let later = ScanPipeline.assemble(
+            drafts: [draft], results: [400: ProbeResult(version: nil, isBusy: nil, models: [model("a", .idle), model("b", .loading)])],
+            manifests: [:], connections: [:], processes: [:], cpuDeltas: working, selfPID: 1, now: old).result
+        #expect(later.models.map(\.state) == [ModelState.executing, ModelState.executing])
+    }
+
+    @Test func theGPUIsCreditedToTheOnlyGPURuntimeWithoutAnAPI() {
+        let draft = Self.sdDraft()
+        // sd.cpp generating on Metal: 10 % of a core, GPU at 96 %.
+        let trickle: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.5, wallSeconds: 5)]
+        let alone = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
+                                          cpuDeltas: trickle, selfPID: 1, gpuUtilization: 0.96).result
+        #expect(alone.runtimes.first?.isBusy == true)
+        #expect(alone.models.allSatisfy { $0.state == ModelState.executing })
+
+        // Without the GPU figure the CPU rule alone says idle.
+        let blind = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
+                                          cpuDeltas: trickle, selfPID: 1, gpuUtilization: nil).result
+        #expect(blind.runtimes.first?.isBusy == false)
+
+        // Real-ESRGAN upscaling in another process at 100 % GPU while sd.cpp
+        // sits idle: two GPU candidates, so neither gets the GPU's credit.
+        let esrgan = ModelFile(path: "/Users/me/upscalers/RealESRGAN_x4plus.pth", sizeBytes: 64 * 1_048_576)
+        let app = Self.process(700, "Qwen Image", ClientResolutionTests.qwen, [ClientResolutionTests.qwen], kind: Classification(.unknown), files: [esrgan])
+        let upscaler = RuntimeDraft(kind: .unknown, process: app, helpers: [], probePort: nil)
+        let both: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.3, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 0.9, wallSeconds: 5)]
+        let shared = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
+                                           cpuDeltas: both, selfPID: 1, gpuUtilization: 1.0).result
+        #expect(shared.runtimes.allSatisfy { $0.isBusy == false })
+        #expect(shared.models.allSatisfy { $0.state == ModelState.idle })
+        #expect(shared.models.contains { $0.role == .upscaler && $0.runtime == .unknown })
+
+        // The upscaler's CPU time crosses the quarter-core line: it is busy on its own merits.
+        let working: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.3, wallSeconds: 5), 700: CPUActivity.Delta(cpuSeconds: 2, wallSeconds: 5)]
+        let upscaling = ScanPipeline.assemble(drafts: [draft, upscaler], results: [:], manifests: [:], connections: [:], processes: [:],
+                                              cpuDeltas: working, selfPID: 1, gpuUtilization: 1.0).result
+        #expect(upscaling.runtimes.first { $0.pid == 700 }?.isBusy == true)
+        #expect(upscaling.runtimes.first { $0.pid == 300 }?.isBusy == false)
+
+        // An Ollama whose API answered doesn't count as a candidate.
+        let ollama = Self.process(500, "ollama", "/opt/homebrew/bin/ollama", ["ollama", "serve"], kind: Classification(.ollama), ports: [11434])
+        let ollamaDraft = RuntimeDraft(kind: .ollama, process: ollama, helpers: [], probePort: 11434)
+        let known = ProbeResult(version: "0.19", isBusy: false, models: [LoadedModel(
+            id: "500:qwen3:8b", name: "qwen3:8b", filePath: nil, runtime: .ollama, pid: 500, sizeBytes: 1, device: .gpu,
+            contextLength: nil, expiresAt: nil, state: .idle, role: .text, clients: [], firstSeen: Date())], apiAnswered: true)
+        let withOllama = ScanPipeline.assemble(drafts: [draft, ollamaDraft], results: [500: known], manifests: [:], connections: [:], processes: [:],
+                                               cpuDeltas: trickle, selfPID: 1, gpuUtilization: 0.96).result
+        #expect(withOllama.runtimes.first { $0.pid == 300 }?.isBusy == true)
     }
 
     @Test func ollamaWithNoModelsIsStillARuntime() {
@@ -825,5 +904,285 @@ struct ScanAssemblyTests {
         })
         #expect(resolved.map(\.name) == ["curl", "Qwen Image"])
         #expect(resolved.last?.pid == 50)
+    }
+}
+
+// MARK: - Ollama: one model per (server, model), whichever path found it
+
+struct OllamaIdentityTests {
+    static let hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    static let projectorHex = "9999999999999999999999999999999999999999999999999999999999999999"
+    static let blob = "/Users/me/.ollama/models/blobs/sha256-\(hex)"
+    static let projector = "/Users/me/.ollama/models/blobs/sha256-\(projectorHex)"
+    static let name = "huihui_ai/qwen3-vl-abliterated:8b-instruct"
+    static let manifests = [hex: name, projectorHex: name]
+
+    /// `/api/ps` as Ollama writes it: `digest` is the manifest's digest (the
+    /// ID `ollama list` shows), not the blob the runner maps.
+    static let ps = """
+    {"models":[{"name":"\(name)","model":"\(name)","size":6550000000,"size_vram":3000000000,
+      "digest":"sha256:5f6e7d8c9b0a5f6e7d8c9b0a5f6e7d8c9b0a5f6e7d8c9b0a5f6e7d8c9b0a5f6e",
+      "details":{"format":"gguf","family":"qwen3vl","families":["qwen3vl"]},
+      "expires_at":"2026-10-01T14:02:11.123456+02:00","context_length":32768}]}
+    """
+
+    static func server(files: [ModelFile] = []) -> AIProcess {
+        ScanAssemblyTests.process(500, "ollama", "/Applications/Ollama.app/Contents/Resources/ollama",
+                                  ["/Applications/Ollama.app/Contents/Resources/ollama", "serve"], kind: Classification(.ollama),
+                                  files: files, ports: [11434])
+    }
+
+    /// The llama-server Ollama spawns for a GGUF model, on its random port.
+    static func llamaRunner(pid: pid_t = 501, port: Int? = 54321) -> AIProcess {
+        var arguments = ["/Applications/Ollama.app/Contents/Resources/lib/ollama/llama-server", "--model", blob, "--mmproj", projector]
+        if let port { arguments += ["--port", "\(port)"] }
+        return ScanAssemblyTests.process(pid, parent: 500, "llama-server", arguments[0], arguments, kind: Classification(.ollama, isOllamaRunner: true),
+                                         files: [ModelFile(path: blob, sizeBytes: 5_700_000_000), ModelFile(path: projector, sizeBytes: 600_000_000)],
+                                         ports: port.map { [$0] } ?? [])
+    }
+
+    /// An `ollama runner` on the same blob (the engine's own runner, or a
+    /// runner being replaced): one more child mapping the same weights.
+    static func ollamaRunner(pid: pid_t = 502) -> AIProcess {
+        ScanAssemblyTests.process(pid, parent: 500, "ollama", "/Applications/Ollama.app/Contents/Resources/ollama",
+                                  ["/Applications/Ollama.app/Contents/Resources/ollama", "runner", "--ollama-engine", "--model", blob],
+                                  kind: Classification(.ollama, isOllamaRunner: true), files: [ModelFile(path: blob, sizeBytes: 5_700_000_000)])
+    }
+
+    static func draft(_ processes: [AIProcess]) throws -> RuntimeDraft {
+        let drafts = ScanPipeline.drafts(from: processes, watched: [.ollama], ports: [:])
+        #expect(drafts.count == 1, "the runners fold into their server")
+        return try #require(drafts.first)
+    }
+
+    @Test func theAPIEntryAndItsRunnerAreOneModelWithOneId() throws {
+        // The server maps the blob too (it reads the GGUF metadata); two children map it.
+        let draft = try Self.draft([Self.server(files: [ModelFile(path: Self.blob, sizeBytes: 5_700_000_000)]), Self.llamaRunner(), Self.ollamaRunner()])
+        let runners = OllamaProbe.runners(in: draft)
+        #expect(runners.count == 2)
+        let ps = try #require(OllamaProbe.parsePS(Data(Self.ps.utf8)))
+
+        let listed = OllamaProbe.assemble(draft: draft, version: "0.19.0", ps: ps, runners: runners, manifests: Self.manifests)
+        #expect(listed.apiAnswered)
+        #expect(listed.models.count == 1, "API entry + llama-server + ollama runner + the server's own mapping = one model")
+        let model = try #require(listed.models.first)
+        #expect(model.id == "500:\(Self.name)")
+        #expect(model.name == Self.name)
+        #expect(model.filePath == Self.blob, "the runner that listens stands for the model")
+        #expect(model.state == .idle, "listed by the API: not loading")
+        #expect(model.device == .split)
+        #expect(model.contextLength == 32_768)
+        #expect(model.expiresAt != nil)
+        #expect(model.sizeBytes == 6_550_000_000)
+        #expect(model.role == .vision)
+
+        // The API didn't answer: the runner path gives the same id.
+        let offline = OllamaProbe.assemble(draft: draft, version: nil, ps: nil, runners: runners, manifests: Self.manifests)
+        #expect(!offline.apiAnswered)
+        #expect(offline.models.count == 1)
+        #expect(offline.models.first?.id == model.id)
+        #expect(offline.models.first?.filePath == Self.blob)
+        #expect(offline.models.first?.state == .idle, "no API and the runner silent: idle, the heuristic decides")
+
+        // Through the pipeline: still one, and it is in the carry-over cache.
+        let output = ScanPipeline.assemble(drafts: [draft], results: [500: listed], manifests: Self.manifests, connections: [:], processes: [:],
+                                           cpuDeltas: [:], selfPID: 1)
+        #expect(output.result.models.count == 1)
+        #expect(output.result.models.first?.id == model.id)
+        #expect(output.apiModels[model.id] != nil)
+    }
+
+    @Test func theServersOwnMappingNeverMakesAModel() throws {
+        let draft = try Self.draft([Self.server(files: [ModelFile(path: Self.blob, sizeBytes: 5_700_000_000)])])
+        #expect(OllamaProbe.runners(in: draft).isEmpty)
+        let offline = OllamaProbe.assemble(draft: draft, version: nil, ps: nil, runners: [], manifests: Self.manifests)
+        #expect(offline.models.isEmpty)
+        let ps = try #require(OllamaProbe.parsePS(Data(Self.ps.utf8)))
+        let listed = OllamaProbe.assemble(draft: draft, version: nil, ps: ps, runners: [], manifests: Self.manifests)
+        #expect(listed.models.count == 1, "the API alone still lists the model")
+        #expect(listed.models.first?.id == "500:\(Self.name)")
+    }
+
+    @Test func oneEntryAndOneRunnerPairByElimination() throws {
+        // No manifest index (models under a root we didn't find): the only runner is the only entry's.
+        let draft = try Self.draft([Self.server(), Self.llamaRunner()])
+        let ps = try #require(OllamaProbe.parsePS(Data(Self.ps.utf8)))
+        let listed = OllamaProbe.assemble(draft: draft, version: nil, ps: ps, runners: OllamaProbe.runners(in: draft), manifests: [:])
+        #expect(listed.models.count == 1)
+        #expect(listed.models.first?.filePath == Self.blob)
+        #expect(listed.models.first?.state == .idle)
+    }
+
+    @Test func anUnlistedRunnerIsLoadingOnlyWhileItDoesNotAnswer() throws {
+        let draft = try Self.draft([Self.server(), Self.llamaRunner()])
+        var runner = try #require(OllamaProbe.runners(in: draft).first)
+        let silent = OllamaProbe.assemble(draft: draft, version: nil, ps: [], runners: [runner], manifests: Self.manifests)
+        #expect(silent.models.first?.state == .loading, "the API answered and doesn't list it; /slots didn't answer: loading")
+        runner.isProcessing = true
+        let serving = OllamaProbe.assemble(draft: draft, version: nil, ps: [], runners: [runner], manifests: Self.manifests)
+        #expect(serving.models.first?.state == .executing, "/slots says it is working: not loading")
+        #expect(serving.isBusy == true)
+    }
+
+    @Test func twoRunnersOnOneBlobKeepTheOneThatListens() {
+        let silentFirst = [Self.ollamaRunner(pid: 400), Self.llamaRunner(pid: 401)]
+        let unique = OllamaProbe.uniqueRunners(OllamaProbe.runners(in: RuntimeDraft(kind: .ollama, process: Self.server(), helpers: silentFirst, probePort: 11434)))
+        #expect(unique.map(\.process.pid) == [401])
+        let other = OllamaProbe.runners(in: RuntimeDraft(kind: .ollama, process: Self.server(), helpers: [Self.ollamaRunner(pid: 402), Self.ollamaRunner(pid: 403)], probePort: 11434))
+        #expect(OllamaProbe.uniqueRunners(other).map(\.process.pid) == [402], "neither listens: the older one")
+    }
+
+    @Test func namesNormalise() {
+        #expect(OllamaProbe.normalizedName("registry.ollama.ai/library/qwen3:8b") == "qwen3:8b")
+        #expect(OllamaProbe.normalizedName("library/qwen3") == "qwen3:latest")
+        #expect(OllamaProbe.normalizedName("hf.co/unsloth/Qwen3-GGUF:Q4_K_M") == "hf.co/unsloth/Qwen3-GGUF:Q4_K_M")
+        #expect(OllamaProbe.normalizedName("huihui_ai/qwen3-vl-abliterated:8b-instruct") == "huihui_ai/qwen3-vl-abliterated:8b-instruct")
+    }
+}
+
+// MARK: - A slow API: last scan's answer carries over
+
+struct CarryOverTests {
+    @Test func apiFieldsSurviveATimedOutProbe() throws {
+        let draft = try OllamaIdentityTests.draft([OllamaIdentityTests.server(), OllamaIdentityTests.llamaRunner()])
+        let runners = OllamaProbe.runners(in: draft)
+        let ps = try #require(OllamaProbe.parsePS(Data(OllamaIdentityTests.ps.utf8)))
+        let manifests = OllamaIdentityTests.manifests
+        // The runner started 100 s before the second scan.
+        let now = Date(timeIntervalSince1970: 1_790_000_100)
+
+        let first = ScanPipeline.assemble(
+            drafts: [draft], results: [500: OllamaProbe.assemble(draft: draft, version: "0.19.0", ps: ps, runners: runners, manifests: manifests)],
+            manifests: manifests, connections: [:], processes: [:], cpuDeltas: [:], selfPID: 1, now: now.addingTimeInterval(-5))
+        let listed = try #require(first.result.models.first)
+        #expect(listed.device == .split)
+
+        // /api/ps timed out; the runner-only path knows the blob, -ngl and nothing else.
+        let timedOut = OllamaProbe.assemble(draft: draft, version: nil, ps: nil, runners: runners, manifests: manifests)
+        #expect(timedOut.models.first?.device == .gpu)
+        #expect(timedOut.models.first?.expiresAt == nil)
+        let resting: [pid_t: CPUActivity.Delta] = [500: CPUActivity.Delta(cpuSeconds: 0.1, wallSeconds: 5), 501: CPUActivity.Delta(cpuSeconds: 0.2, wallSeconds: 5)]
+        let second = ScanPipeline.assemble(drafts: [draft], results: [500: timedOut], manifests: manifests, connections: [:], processes: [:],
+                                           cpuDeltas: resting, selfPID: 1, previous: first.apiModels, now: now)
+        let carried = try #require(second.result.models.first)
+        #expect(second.result.models.count == 1)
+        #expect(carried.id == listed.id)
+        #expect(carried.name == listed.name)
+        #expect(carried.filePath == OllamaIdentityTests.blob)
+        #expect(carried.device == .split, "the API's device, not the -ngl guess")
+        #expect(carried.contextLength == 32_768)
+        #expect(carried.expiresAt == listed.expiresAt)
+        #expect(carried.sizeBytes == listed.sizeBytes)
+        #expect(carried.role == .vision)
+        #expect(carried.state == .idle)
+        #expect(second.apiModels[carried.id] != nil, "the carried model stays available for the next slow scan")
+
+        // Working meanwhile: the heuristic upgrades idle to executing, never to loading.
+        let working: [pid_t: CPUActivity.Delta] = [500: CPUActivity.Delta(cpuSeconds: 0.1, wallSeconds: 5), 501: CPUActivity.Delta(cpuSeconds: 3, wallSeconds: 5)]
+        let busy = ScanPipeline.assemble(drafts: [draft], results: [500: timedOut], manifests: manifests, connections: [:], processes: [:],
+                                         cpuDeltas: working, selfPID: 1, previous: first.apiModels, now: now)
+        #expect(busy.result.models.first?.state == .executing)
+    }
+
+    @Test func aCarriedNameRenamesTheRunnerPathsModel() throws {
+        // No manifest index at all: the runner path would call the model by its blob.
+        let draft = try OllamaIdentityTests.draft([OllamaIdentityTests.server(), OllamaIdentityTests.llamaRunner()])
+        let runners = OllamaProbe.runners(in: draft)
+        let ps = try #require(OllamaProbe.parsePS(Data(OllamaIdentityTests.ps.utf8)))
+        let now = Date(timeIntervalSince1970: 1_790_000_100)
+        let first = ScanPipeline.assemble(drafts: [draft], results: [500: OllamaProbe.assemble(draft: draft, version: nil, ps: ps, runners: runners, manifests: [:])],
+                                          manifests: [:], connections: [:], processes: [:], cpuDeltas: [:], selfPID: 1, now: now)
+        let offline = OllamaProbe.assemble(draft: draft, version: nil, ps: nil, runners: runners, manifests: [:])
+        #expect(offline.models.first?.name == "sha256-\(OllamaIdentityTests.hex)")
+        let second = ScanPipeline.assemble(drafts: [draft], results: [500: offline], manifests: [:], connections: [:], processes: [:],
+                                           cpuDeltas: [:], selfPID: 1, previous: first.apiModels, now: now)
+        #expect(second.result.models.first?.id == "500:\(OllamaIdentityTests.name)", "matched by file: the API's name and id")
+        #expect(second.result.models.first?.name == OllamaIdentityTests.name)
+    }
+
+    @Test func loadingIsBelievedOnlyFromAYoungProcess() throws {
+        let draft = try OllamaIdentityTests.draft([OllamaIdentityTests.server(), OllamaIdentityTests.llamaRunner()])
+        let loading = LoadedModel(id: "500:x", name: "x", filePath: OllamaIdentityTests.blob, runtime: .ollama, pid: 500, sizeBytes: 1,
+                                  device: .gpu, contextLength: nil, expiresAt: nil, state: .loading, role: .text, clients: [], firstSeen: Date())
+        let young = ScanPipeline.carryOver([loading], in: draft, previous: [:], now: Date(timeIntervalSince1970: 1_790_000_010))
+        #expect(young.first?.state == .loading)
+        let old = ScanPipeline.carryOver([loading], in: draft, previous: [:], now: Date(timeIntervalSince1970: 1_790_000_030))
+        #expect(old.first?.state == .idle)
+        #expect(ScanPipeline.age(of: loading, in: draft, now: Date(timeIntervalSince1970: 1_790_000_030)) == 30)
+    }
+
+    @Test func anExpiredUnloadTimeIsNotCarried() throws {
+        let draft = try OllamaIdentityTests.draft([OllamaIdentityTests.server(), OllamaIdentityTests.llamaRunner()])
+        let past = Date(timeIntervalSince1970: 1_790_000_050)
+        let remembered = LoadedModel(id: "500:x", name: "x", filePath: OllamaIdentityTests.blob, runtime: .ollama, pid: 500, sizeBytes: 1,
+                                     device: .gpu, contextLength: 4096, expiresAt: past, state: .idle, role: .text, clients: [], firstSeen: Date())
+        let fresh = LoadedModel(id: "500:x", name: "x", filePath: OllamaIdentityTests.blob, runtime: .ollama, pid: 500, sizeBytes: 1,
+                                device: .gpu, contextLength: nil, expiresAt: nil, state: .idle, role: .text, clients: [], firstSeen: Date())
+        let carried = ScanPipeline.carryOver([fresh], in: draft, previous: ["500:x": remembered], now: Date(timeIntervalSince1970: 1_790_000_100))
+        #expect(carried.first?.expiresAt == nil)
+        #expect(carried.first?.contextLength == 4096)
+    }
+}
+
+// MARK: - Small upscalers count as weights
+
+struct UpscalerFileTests {
+    static let upscalerNames = ["RealESRGAN_x4plus.pth", "4x-UltraSharp.pth", "4xNMKD-Siax_200k.pth", "2x_Loyaldk-SuperPony_500000_V2.0.pth",
+                                "GFPGANv1.4.pth", "codeformer.pth", "upscaler.safetensors", "realesr-general-x4v3.pth"]
+    static let otherNames = ["qwen-image-Q4_K_M.gguf", "sd_xl_base_1.0_1024x1024.safetensors", "mmproj-f16.gguf", "flux-vae.safetensors", "ggml-base.bin"]
+
+    @Test(arguments: UpscalerFileTests.upscalerNames) func upscalerNamesAreRecognised(name: String) {
+        #expect(ModelRoles.isUpscalerName(name))
+        #expect(ModelRoles.guess(fileName: name, runtime: .unknown) == .upscaler)
+        #expect(ModelRoles.guess(fileName: name, runtime: .sdcpp) == .upscaler)
+    }
+
+    @Test(arguments: UpscalerFileTests.otherNames) func otherNamesAreNot(name: String) {
+        #expect(!ModelRoles.isUpscalerName(name))
+    }
+
+    @Test func upscalerBinFilesArePaths() {
+        #expect(ModelFiles.isModelPath("/Users/me/up/RealESRGAN_x4plus.bin"))
+        #expect(!ModelFiles.isModelPath("/Users/me/some/random.bin"))
+    }
+
+    @Test func floorsByName() {
+        let mb: UInt64 = 1_048_576
+        #expect(ModelFiles.sizeFloor(forPath: "/m/RealESRGAN_x4plus.pth", minimumBytes: 100 * mb, upscalerMinimumBytes: 32 * mb) == 32 * mb)
+        #expect(ModelFiles.sizeFloor(forPath: "/m/RealESRGAN_x4plus.bin", minimumBytes: 100 * mb, upscalerMinimumBytes: 32 * mb) == 32 * mb)
+        #expect(ModelFiles.sizeFloor(forPath: "/m/RealESRGAN_x4plus.pth", minimumBytes: 100 * mb, upscalerMinimumBytes: nil) == 100 * mb)
+        #expect(ModelFiles.sizeFloor(forPath: "/m/RealESRGAN_x4plus.onnx", minimumBytes: 100 * mb, upscalerMinimumBytes: 32 * mb) == 100 * mb)
+        #expect(ModelFiles.sizeFloor(forPath: "/m/1024x1024.safetensors", minimumBytes: 100 * mb, upscalerMinimumBytes: 32 * mb) == 100 * mb)
+        #expect(ModelFiles.sizeFloor(forPath: "/m/x.gguf", minimumBytes: 8 * mb, upscalerMinimumBytes: 32 * mb) == 8 * mb, "never raises the bar")
+    }
+
+    /// A 64 MB RealESRGAN_x4plus.pth passes the generic filter; a 64 MB
+    /// checkpoint with another name and a 20 MB GFPGAN do not.
+    @Test func aSmallUpscalerPassesTheGenericFilter() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gyozavitals-upscaler-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let mb: UInt64 = 1_048_576
+        func sparse(_ name: String, bytes: UInt64) throws -> String {
+            let url = directory.appendingPathComponent(name)
+            #expect(FileManager.default.createFile(atPath: url.path, contents: nil))
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.truncate(atOffset: bytes)
+            try handle.close()
+            return url.path
+        }
+        let esrgan = try sparse("RealESRGAN_x4plus.pth", bytes: 64 * mb)
+        let other = try sparse("other_1024x1024.ckpt", bytes: 64 * mb)
+        let tiny = try sparse("GFPGANv1.4.pth", bytes: 20 * mb)
+        let big = try sparse("big.safetensors", bytes: 100 * mb)
+        let paths = [esrgan, other, tiny, big]
+
+        let generic = ModelFiles.files(amongPaths: paths, minimumBytes: ScanPipeline.genericModelFloor, upscalerMinimumBytes: ScanPipeline.upscalerModelFloor)
+        #expect(generic.map(\.name).sorted() == ["RealESRGAN_x4plus.pth", "big.safetensors"])
+        #expect(generic.first { $0.name.hasPrefix("RealESRGAN") }?.sizeBytes == 64 * mb)
+        let strict = ModelFiles.files(amongPaths: paths, minimumBytes: ScanPipeline.genericModelFloor)
+        #expect(strict.map(\.name) == ["big.safetensors"])
+        let classified = ModelFiles.files(amongPaths: paths, minimumBytes: ScanPipeline.classifiedModelFloor)
+        #expect(classified.count == 4, "a classified runtime's floor is lower than all of them")
     }
 }

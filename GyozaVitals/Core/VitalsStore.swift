@@ -124,6 +124,7 @@ final class VitalsStore: ObservableObject {
     private var hasScanned = false
 
     func refreshScan() async {
+        scanner.noteSystemGPU(utilization: system?.gpu?.utilization)
         let result = await scanner.scan(watched: settings.watchedRuntimes, ports: settings.ports)
         if hasScanned {
             diff(old: models, new: result.models, oldRuntimes: runtimes, newRuntimes: result.runtimes)

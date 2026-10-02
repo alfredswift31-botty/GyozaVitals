@@ -3,12 +3,16 @@ import Foundation
 // Shared pieces of the runtime probes: a GET-only HTTP client with a short
 // timeout, lenient JSON access, and a deadline for concurrent work.
 
-/// Loopback GETs with a 1.5 s timeout. Never POSTs: 1.0 is read-only.
+/// Loopback GETs with a short timeout. Never POSTs: 1.0 is read-only.
 nonisolated final class HTTPClient: @unchecked Sendable {
+    /// Ollama under memory pressure can take seconds to answer /api/ps; 1.5 s
+    /// made the scanner fall back to the runner-only picture mid-request.
+    static let defaultTimeout: TimeInterval = 4
+
     let timeout: TimeInterval
     private let session: URLSession
 
-    init(timeout: TimeInterval = 1.5) {
+    init(timeout: TimeInterval = HTTPClient.defaultTimeout) {
         self.timeout = timeout
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout

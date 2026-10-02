@@ -12,11 +12,18 @@ import FoundationModels
 final class ModelScanner: ModelScanSource {
     private let pipeline = ScanPipeline()
     private var firstSeen: [String: Date] = [:]
+    /// The system GPU utilisation the store last measured (0...1), for the
+    /// busy heuristic of runtimes with no API. Nil: unknown, CPU rule only.
+    var gpuUtilization: Double?
 
     init() {}
 
+    func noteSystemGPU(utilization: Double?) {
+        gpuUtilization = utilization
+    }
+
     func scan(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult {
-        let output = await pipeline.run(watched: watched, ports: ports)
+        let output = await pipeline.run(watched: watched, ports: ports, gpuUtilization: gpuUtilization)
         var result = output.result
         let now = Date()
         var remembered: [String: Date] = [:]
@@ -95,23 +102,30 @@ struct ClientResolver {
 
 /// One scan, start to finish, off the main actor.
 actor ScanPipeline {
-    private let client = HTTPClient(timeout: 1.5)
+    private let client = HTTPClient()
     private var manifestNames: [String: String] = [:]
     private var manifestRoots: [String] = []
     private var manifestsBuiltAt = Date.distantPast
     private var cpuActivity = CPUActivity()
+    /// What the APIs said last scan, by model id, for a scan where they don't answer.
+    private var apiModels: [String: LoadedModel] = [:]
 
-    /// Each probe gets this long; the file fallback answers for a slow one.
-    static let probeDeadline: Double = 2.6
+    /// Each probe gets this long (its GETs time out at `HTTPClient.defaultTimeout`
+    /// and run concurrently); the file fallback answers for a slower one.
+    static let probeDeadline: Double = HTTPClient.defaultTimeout + 1
     /// Below this a process can't hold a model worth a region walk.
     static let genericFootprintFloor: UInt64 = 256 * 1_048_576
     /// A mapped weights file this large makes an unclassified process a runtime.
     static let genericModelFloor: UInt64 = 100 * 1_048_576
+    /// ...unless its name says upscaler: Real-ESRGAN x4plus is 64 MB.
+    static let upscalerModelFloor: UInt64 = 32 * 1_048_576
     /// Weights a classified runtime holds can be small (a projector, a tiny whisper).
     static let classifiedModelFloor: UInt64 = 8 * 1_048_576
     static let genericCandidateLimit = 40
+    /// A process younger than this may still be loading its model.
+    static let youngProcessSeconds: TimeInterval = 20
 
-    func run(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> PipelineOutput {
+    func run(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int], gpuUtilization: Double? = nil) async -> PipelineOutput {
         let selfPID = getpid()
         let sampledAt = ProcessInfo.processInfo.systemUptime
         let processes = ProcessList.currentUserProcesses()
@@ -149,30 +163,53 @@ actor ScanPipeline {
         let allPorts = Set(drafts.flatMap { $0.allListeningPorts })
         let connections = ClientFinder.connections(to: allPorts, among: processes)
 
-        return Self.assemble(drafts: drafts, results: results, manifests: manifests, connections: connections,
-                             processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID)
+        let output = Self.assemble(drafts: drafts, results: results, manifests: manifests, connections: connections,
+                                   processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID,
+                                   gpuUtilization: gpuUtilization, previous: apiModels, now: Date())
+        apiModels = output.apiModels
+        return output
     }
 
     /// Runtimes and models from what was found, pure: drafts, what their
-    /// probes said, who connects to their ports, and how much CPU they used
-    /// since the last scan.
+    /// probes said, who connects to their ports, how much CPU they used
+    /// since the last scan, the system GPU, and what the APIs said last time
+    /// (`previous`, by model id) for a probe that didn't answer now.
     static func assemble(drafts: [RuntimeDraft], results: [pid_t: ProbeResult], manifests: [String: String],
                          connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
-                         cpuDeltas: [pid_t: CPUActivity.Delta], selfPID: pid_t) -> PipelineOutput {
+                         cpuDeltas: [pid_t: CPUActivity.Delta], selfPID: pid_t,
+                         gpuUtilization: Double? = nil, previous: [String: LoadedModel] = [:], now: Date = Date()) -> PipelineOutput {
         var runtimes: [RuntimeInstance] = []
         var models: [LoadedModel] = []
         var chains: [pid_t: [ProcessChainLink]] = [:]
+        var apiModels: [String: LoadedModel] = [:]
+
+        // The probe's models, or the fallback's with last scan's API fields
+        // carried over, before anything is counted.
+        var probes: [pid_t: ProbeResult] = [:]
+        var resident: [pid_t: [LoadedModel]] = [:]
         for draft in drafts {
             let probe = results[draft.process.pid] ?? RuntimeProbes.offline(draft, ollamaManifests: manifests)
+            probes[draft.process.pid] = probe
+            resident[draft.process.pid] = probe.apiAnswered ? probe.models : carryOver(probe.models, in: draft, previous: previous, now: now)
+        }
+        // GPU-using runtimes whose busy state no API gave: the GPU is credited
+        // to one of them only when it is the only one (see CPUActivity).
+        let gpuCandidates = drafts.filter { probes[$0.process.pid]?.isBusy == nil && usesGPU(resident[$0.process.pid] ?? []) }.count
+
+        for draft in drafts {
+            let pid = draft.process.pid
+            let probe = probes[pid] ?? .nothing
             let clients = Self.clients(for: draft, connections: connections, processes: byPID,
                                        excluding: draft.pids.union([selfPID]), chains: &chains)
 
-            // No answer from an API: the CPU-time heuristic decides, and a busy
+            // No answer from an API: the CPU/GPU heuristic decides, and a busy
             // runtime's resident models are executing. Loading stays loading.
             var isBusy = probe.isBusy
-            var probedModels = probe.models
+            var probedModels = resident[pid] ?? []
             if isBusy == nil {
-                isBusy = CPUActivity.busy(deltas: draft.pids.compactMap { cpuDeltas[$0] })
+                let share = CPUActivity.share(deltas: draft.pids.compactMap { cpuDeltas[$0] })
+                isBusy = CPUActivity.busy(cpuShare: share, gpuUtilization: gpuUtilization,
+                                          gpuCandidates: usesGPU(probedModels) ? gpuCandidates : 0)
                 if isBusy == true {
                     probedModels = probedModels.map { model in
                         var model = model
@@ -181,9 +218,12 @@ actor ScanPipeline {
                     }
                 }
             }
+            for model in probedModels where probe.apiAnswered || previous[model.id] != nil {
+                apiModels[model.id] = model
+            }
 
             runtimes.append(RuntimeInstance(
-                pid: draft.process.pid, kind: draft.kind, processName: draft.process.record.name,
+                pid: pid, kind: draft.kind, processName: draft.process.record.name,
                 executablePath: draft.process.record.executablePath, listeningPorts: draft.process.listeningPorts,
                 version: probe.version, footprintBytes: draft.footprintBytes, isBusy: isBusy, clients: clients))
             models += probedModels.map { model in
@@ -194,7 +234,59 @@ actor ScanPipeline {
         }
         runtimes.sort { ($0.kind.rawValue, $0.pid) < ($1.kind.rawValue, $1.pid) }
         models.sort { ($0.runtime.rawValue, $0.pid, $0.name) < ($1.runtime.rawValue, $1.pid, $1.name) }
-        return PipelineOutput(result: ScanResult(runtimes: runtimes, models: models, appleIntelligenceAvailable: nil), clientChains: chains)
+        return PipelineOutput(result: ScanResult(runtimes: runtimes, models: models, appleIntelligenceAvailable: nil),
+                              clientChains: chains, apiModels: apiModels)
+    }
+
+    /// A runtime that holds weights on the GPU (or where we can't tell).
+    static func usesGPU(_ models: [LoadedModel]) -> Bool {
+        models.contains { $0.device != .cpu }
+    }
+
+    // MARK: Carry-over
+
+    /// The fallback's models with what the API said about them last time,
+    /// for a probe that timed out or failed while its process is still
+    /// here: the API's name (and so the id), device, context, role and
+    /// unload time survive a slow answer instead of flipping to the file's.
+    /// The state is never `.loading` unless the process holding the model is
+    /// younger than `youngProcessSeconds`: an older one that stopped
+    /// answering is busy or idle, which the heuristic then decides.
+    static func carryOver(_ models: [LoadedModel], in draft: RuntimeDraft, previous: [String: LoadedModel], now: Date) -> [LoadedModel] {
+        guard !models.isEmpty else { return models }
+        let byPath = Dictionary(previous.values.filter { $0.pid == draft.process.pid }.compactMap { model in model.filePath.map { ($0, model) } },
+                                uniquingKeysWith: { first, _ in first })
+        return models.map { model in
+            let young = age(of: model, in: draft, now: now) < youngProcessSeconds
+            var state = model.state
+            if state == .loading, !young { state = .idle }
+            guard let remembered = previous[model.id] ?? model.filePath.flatMap({ byPath[$0] }) else {
+                var model = model
+                model.state = state
+                return model
+            }
+            return LoadedModel(
+                id: remembered.id, name: remembered.name, filePath: model.filePath ?? remembered.filePath, runtime: model.runtime,
+                pid: model.pid, sizeBytes: remembered.sizeBytes > 0 ? remembered.sizeBytes : model.sizeBytes,
+                device: remembered.device != .unknown ? remembered.device : model.device,
+                contextLength: model.contextLength ?? remembered.contextLength,
+                expiresAt: remembered.expiresAt.flatMap { $0 > now ? $0 : nil },
+                state: state, role: remembered.role, clients: [], firstSeen: model.firstSeen)
+        }
+    }
+
+    /// How long the process that holds the model has been running: the
+    /// youngest of the draft's processes that map or name its file, else
+    /// the runtime's main process. Ollama's runner, not its server.
+    static func age(of model: LoadedModel, in draft: RuntimeDraft, now: Date) -> TimeInterval {
+        var start = draft.process.record.startTime
+        if let path = model.filePath {
+            let holders = draft.allProcesses.filter { process in
+                process.files.contains { $0.path == path } || process.argumentPath(flags: ["--model", "-m"]) == path
+            }
+            if let youngest = holders.map(\.record.startTime).max() { start = youngest }
+        }
+        return now.timeIntervalSince1970 - TimeInterval(start)
     }
 
     // MARK: Processes
@@ -220,7 +312,8 @@ actor ScanPipeline {
             .sorted { $0.footprintBytes > $1.footprintBytes }
             .prefix(genericCandidateLimit)
         return candidates.compactMap { process in
-            let files = ModelFiles.files(amongPaths: ProcessFiles.mappedFiles(pid: process.pid), minimumBytes: genericModelFloor)
+            let files = ModelFiles.files(amongPaths: ProcessFiles.mappedFiles(pid: process.pid), minimumBytes: genericModelFloor,
+                                         upscalerMinimumBytes: upscalerModelFloor)
             guard !files.isEmpty else { return nil }
             return AIProcess(record: process, classification: Classification(.unknown), sockets: ProcessFiles.sockets(pid: process.pid),
                              files: files, currentDirectory: nil)

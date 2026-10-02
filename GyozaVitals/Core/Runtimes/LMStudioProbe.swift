@@ -49,7 +49,7 @@ nonisolated enum LMStudioProbe {
                 sizeBytes: file?.sizeBytes ?? 0, device: .unknown, contextLength: entry.loadedContextLength, expiresAt: nil,
                 state: entry.state == "loading" ? .loading : .idle, role: role, clients: [], firstSeen: Date())
         }
-        return ProbeResult(version: nil, isBusy: nil, models: models)
+        return ProbeResult(version: nil, isBusy: nil, models: models, apiAnswered: true)
     }
 
     /// Without the API: whatever GGUF the LM Studio processes map.

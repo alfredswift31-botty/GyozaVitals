@@ -127,14 +127,41 @@ nonisolated enum OllamaProbe {
         assemble(draft: draft, version: nil, ps: nil, runners: runners(in: draft), manifests: manifests)
     }
 
+    /// One model per (server, model): the API entry and the runner that
+    /// serves it are the same model, whichever of the two the scan got.
+    ///
+    /// `/api/ps` reports the *manifest* digest (the ID `ollama list` shows);
+    /// the runner's `--model` blob is named by the `image.model` *layer*
+    /// digest. They never agree, so an entry is matched to its runner by the
+    /// name the manifests give the blob, and by elimination when one entry
+    /// and one runner are left. The id is `"<server pid>:<name>"` on both
+    /// paths, with the manifest name for an unlisted runner.
+    ///
+    /// Only runners name models: the server opens or maps a blob to read its
+    /// GGUF metadata, and that mapping is never a model. Two child processes
+    /// on one blob (an `ollama runner` and a `llama-server`, or a runner
+    /// being replaced) are one model, represented by the one that listens.
     static func assemble(draft: RuntimeDraft, version: String?, ps: [OllamaPSModel]?, runners: [OllamaRunner],
                          manifests: [String: String]) -> ProbeResult {
         let pid = draft.process.pid
-        var models: [LoadedModel] = []
+        let runners = uniqueRunners(runners)
+        var pairs: [(entry: OllamaPSModel, runner: OllamaRunner?)] = []
         var matched = Set<pid_t>()
         for entry in ps ?? [] {
-            let runner = runners.first { $0.blobHex != nil && $0.blobHex == entry.digestHex }
+            let runner = runners.first { !matched.contains($0.process.pid) && matches(entry, $0, manifests: manifests) }
             if let runner { matched.insert(runner.process.pid) }
+            pairs.append((entry, runner))
+        }
+        // One entry without a runner and one runner without an entry: Ollama
+        // starts one runner per loaded model, so they are each other's.
+        if let only = pairs.indices.filter({ pairs[$0].runner == nil }).first, pairs.filter({ $0.runner == nil }).count == 1,
+           let leftover = runners.filter({ !matched.contains($0.process.pid) }).first, runners.count - matched.count == 1 {
+            pairs[only].runner = leftover
+            matched.insert(leftover.process.pid)
+        }
+
+        var models: [LoadedModel] = []
+        for (entry, runner) in pairs {
             let size = entry.sizeBytes > 0 ? entry.sizeBytes : (runner?.blobPath.flatMap(ModelFiles.size(ofFile:)) ?? 0)
             models.append(LoadedModel(
                 id: "\(pid):\(entry.name)", name: entry.name, filePath: runner?.blobPath, runtime: .ollama, pid: pid,
@@ -142,13 +169,19 @@ nonisolated enum OllamaProbe {
                 expiresAt: entry.expiresAt, state: runner?.isProcessing == true ? .executing : .idle,
                 role: ModelRoles.guess(ollamaName: entry.name, families: entry.families), clients: [], firstSeen: Date()))
         }
-        // Runners the API didn't list: still loading, or the API is off.
+        // Runners the API didn't list: still loading, or the API is off. A
+        // runner that answers /slots is serving, whatever the API says.
         for runner in runners where !matched.contains(runner.process.pid) {
             let name = runner.blobHex.flatMap { manifests[$0] }
                 ?? runner.blobPath.map { ($0 as NSString).lastPathComponent }
                 ?? "ollama model"
             let size = runner.blobPath.flatMap(ModelFiles.size(ofFile:)) ?? runner.process.files.reduce(0) { $0 + $1.sizeBytes }
-            let state: ModelState = ps != nil ? .loading : (runner.isProcessing == true ? .executing : .idle)
+            let state: ModelState
+            switch runner.isProcessing {
+            case .some(true): state = .executing
+            case .some(false): state = .idle
+            case nil: state = ps != nil ? .loading : .idle
+            }
             let device: Device = ModelFiles.flagIsZero(runner.process.record.arguments, flags: ["-ngl", "--n-gpu-layers", "--gpu-layers"]) ? .cpu : .gpu
             models.append(LoadedModel(
                 id: "\(pid):\(name)", name: name, filePath: runner.blobPath, runtime: .ollama, pid: pid,
@@ -157,7 +190,56 @@ nonisolated enum OllamaProbe {
         }
         let answered = runners.compactMap(\.isProcessing)
         let isBusy: Bool? = answered.isEmpty ? nil : answered.contains(true)
-        return ProbeResult(version: version, isBusy: isBusy, models: models)
+        return ProbeResult(version: version, isBusy: isBusy, models: models, apiAnswered: ps != nil)
+    }
+
+    /// Whether a `/api/ps` entry describes the runner: the same blob digest
+    /// (should Ollama ever report the layer's), or the name the manifests
+    /// give the runner's blob.
+    static func matches(_ entry: OllamaPSModel, _ runner: OllamaRunner, manifests: [String: String]) -> Bool {
+        guard let hex = runner.blobHex else { return false }
+        if entry.digestHex == hex { return true }
+        guard let name = manifests[hex] else { return false }
+        let normalized = normalizedName(name)
+        return normalized == normalizedName(entry.name) || normalized == normalizedName(entry.model)
+    }
+
+    /// "registry.ollama.ai/library/qwen3:8b", "library/qwen3:8b" and
+    /// "qwen3:8b" are one model; a missing tag means "latest".
+    static func normalizedName(_ name: String) -> String {
+        var name = name
+        for prefix in ["registry.ollama.ai/", "library/"] where name.hasPrefix(prefix) { name.removeFirst(prefix.count) }
+        let afterSlash = name.lastIndex(of: "/").map { name.index(after: $0) } ?? name.startIndex
+        if !name[afterSlash...].contains(":") { name += ":latest" }
+        return name
+    }
+
+    /// One runner per blob: the one that listens on a port, else the oldest
+    /// (lowest pid). Runners that name no blob stay as they are.
+    static func uniqueRunners(_ runners: [OllamaRunner]) -> [OllamaRunner] {
+        var kept: [OllamaRunner] = []
+        var indexByBlob: [String: Int] = [:]
+        for runner in runners.sorted(by: { $0.process.pid < $1.process.pid }) {
+            guard let key = runner.blobHex ?? runner.blobPath else {
+                kept.append(runner)
+                continue
+            }
+            if let index = indexByBlob[key] {
+                let current = kept[index]
+                if ranks(runner, above: current) { kept[index] = runner }
+            } else {
+                indexByBlob[key] = kept.count
+                kept.append(runner)
+            }
+        }
+        return kept
+    }
+
+    private static func ranks(_ runner: OllamaRunner, above other: OllamaRunner) -> Bool {
+        let listens = !runner.process.listeningPorts.isEmpty, otherListens = !other.process.listeningPorts.isEmpty
+        if listens != otherListens { return listens }
+        if (runner.isProcessing != nil) != (other.isProcessing != nil) { return runner.isProcessing != nil }
+        return runner.process.pid < other.process.pid
     }
 }
 
