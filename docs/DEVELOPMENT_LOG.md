@@ -43,7 +43,7 @@ Two CI lessons from the scanner: the SDK struct is `proc_vnodepathinfo` (not `vn
 CI is green on macOS 26: build, all tests (core, metrics on the real runner, scanner on the real test process, snapshots), the built app checked for `LSUIElement`, no sandbox entitlement and a compiled icon.
 
 ## Not verified (needs the user's Mac)
-- Ollama with models loaded (names, unload countdown, runner `/slots` "executing"), koboldcpp, and "used by" naming Flow and the bot. The first real run (1.0, see 1.0.1 below) verified sd.cpp, whisper, an idle Ollama and the system figures.
+- Ollama's own "executing" state (its newer engine's runner may not answer `/slots`; the heuristic covers it), koboldcpp, and "used by" naming Flow and the bot. Ollama names, countdown and "used by Qwen Image" were verified on 1.0.2; sd.cpp's red dot on 1.0.4. The first real run (1.0, see 1.0.1 below) verified sd.cpp, whisper, an idle Ollama and the system figures.
 - GPU figures on macOS 26/27 (the IOKit key may be absent on some chips: the row hides).
 - The P/E-core index ordering assumption.
 - The status glyph on the Clear and Tinted menu bars.
@@ -95,6 +95,8 @@ Unverified until the user's next screenshot: the 0.5 % floor against real Metal 
 
 ## 1.0.4: the number from the diagnostics pane (2 Oct 2026)
 First screenshot of the pane, mid-generation: `sd.cpp · api: no api · cpu 0.004 · gpu 1.00 · candidate · decided by none`; `ollama · cpu 0.000 · not a candidate`; `whisper.cpp · cpu 0.003 · not a candidate`. The rule had the right candidate and a busy GPU, and rejected it because the CPU floor was 0.005 and sd.cpp generating on Metal reads 0.004: a Metal loop is almost entirely GPU. The floor is now 0.001. Idle runtimes read 0.000, so the margin that protects the upscaler case survives. Two releases of guessing from the outside; one screenshot from the inside. The pane stays.
+
+**Verified by the user on 1.0.4:** mid-generation, all four sd.cpp rows carry the red dot, whisper none, GPU 100 %. The red dot has now been seen working on a real Metal workload.
 
 Also confirmed by the 1.0.2 prompt-helper screenshot: one Ollama row, a live unload countdown, no "loading", "used by Qwen Image".
 
