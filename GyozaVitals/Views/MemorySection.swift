@@ -63,7 +63,8 @@ struct MemorySection: View {
                 .frame(width: Theme.Layout.column, alignment: .leading)
             MetaPair(label: "Wired", value: value(\.wiredBytes), monospaced: true)
                 .frame(width: Theme.Layout.column, alignment: .leading)
-            MetaPair(label: "Compressed", value: value(\.compressedBytes), monospaced: true)
+            // "Compressed" needs ~82 pt at label size and would clip in a 77 pt column.
+            MetaPair(label: "Compr.", value: value(\.compressedBytes), monospaced: true)
                 .frame(width: Theme.Layout.column, alignment: .leading)
             MetaPair(label: "Free", value: value(\.freeBytes), monospaced: true)
                 .frame(width: Theme.Layout.column, alignment: .leading)

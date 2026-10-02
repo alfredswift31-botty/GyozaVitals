@@ -121,7 +121,7 @@ enum Theme {
         static let settingsWidth: CGFloat = 520
         static let settingsHeight: CGFloat = 700
         /// Label-over-value column: four to a row. The memory legend is four
-        /// of these (APP / WIRED / COMPRESSED / FREE), filling the 308 pt content column.
+        /// of these (APP / WIRED / COMPR. / FREE), filling the 308 pt content column.
         static let column: CGFloat = 77
         static let labelRow: CGFloat = 20
         static let textRow: CGFloat = 16
