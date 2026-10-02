@@ -10,6 +10,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | 1.0.1 | 2026-10-02 | [v1.0.1](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.1) |
 | 1.0.2 | 2026-10-02 | [v1.0.2](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.2) |
 | 1.0.3 | 2026-10-02 | [v1.0.3](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.3) |
+| 1.0.4 | 2026-10-02 | [v1.0.4](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.4) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -91,6 +92,11 @@ Why the 1.0.2 rule failed: it credited the GPU only with exactly one candidate, 
 - **Diagnostics pane** at the bottom of Settings: one line per runtime with the probe note ("api answered", "no api", "api timed out, carried over"), CPU share, GPU utilisation, candidate or not, and which signal decided. Two attempts at this rule were tuned from outside the app; the next one is read from inside it.
 
 Unverified until the user's next screenshot: the 0.5 % floor against real Metal work.
+
+## 1.0.4: the number from the diagnostics pane (2 Oct 2026)
+First screenshot of the pane, mid-generation: `sd.cpp · api: no api · cpu 0.004 · gpu 1.00 · candidate · decided by none`; `ollama · cpu 0.000 · not a candidate`; `whisper.cpp · cpu 0.003 · not a candidate`. The rule had the right candidate and a busy GPU, and rejected it because the CPU floor was 0.005 and sd.cpp generating on Metal reads 0.004: a Metal loop is almost entirely GPU. The floor is now 0.001. Idle runtimes read 0.000, so the margin that protects the upscaler case survives. Two releases of guessing from the outside; one screenshot from the inside. The pane stays.
+
+Also confirmed by the 1.0.2 prompt-helper screenshot: one Ollama row, a live unload countdown, no "loading", "used by Qwen Image".
 
 ## Working notes
 - Work goes on `develop`; releases come from `main`.

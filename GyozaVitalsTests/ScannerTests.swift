@@ -652,7 +652,7 @@ struct CPUActivityTests {
         (0.01, 0.96, true, true), // Metal-bound sd.cpp at a hundredth of a core: credited, so busy
         (0.10, 0.96, false, false), // not credited: another candidate out-ranks it, or none stands out
         (0.10, 0.50, true, false), // GPU not busy
-        (0.005, 0.80, true, true), // both floors are inclusive
+        (0.001, 0.80, true, true), // both floors are inclusive
         (0.26, 0.0, false, true), // the CPU rule wins regardless of the GPU
         (0.26, nil, false, true),
     ]
@@ -671,9 +671,10 @@ struct CPUActivityTests {
 
     /// (system GPU, candidates by pid with their CPU share) → the pid the GPU is credited to.
     static let creditCases: [(Double?, [pid_t: Double?], pid_t?)] = [
-        (1.0, [300: 0.01], 300), // the only candidate, above half a percent
+        (1.0, [300: 0.01], 300), // the only candidate, above the floor
         (1.0, [300: 0.01, 920: 0.0], 300), // a sleeping companion doesn't block it
-        (1.0, [300: 0.004], nil), // under the floor: a game or a video owns the GPU
+        (1.0, [300: 0.004], 300), // sd.cpp generating on Metal, as measured on the owner's Mac
+        (1.0, [300: 0.0005], nil), // under the floor: a game or a video owns the GPU
         (1.0, [300: 0.02, 700: 0.015], nil), // within 2× of each other: neither
         (1.0, [300: 0.02, 700: 0.01], 300), // exactly 2× is enough
         (1.0, [300: 0.01, 700: 0.30], 700), // the upscaler out-ranks an idle sd.cpp

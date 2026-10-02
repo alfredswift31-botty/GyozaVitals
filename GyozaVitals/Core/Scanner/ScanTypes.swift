@@ -168,10 +168,13 @@ nonisolated enum FileProbe {
 /// second rule credits a busy GPU (≥ 80 %) to one runtime: among the
 /// candidates (runtimes whose busy state no API gave and that hold GPU
 /// weights or generate images), the one with the highest CPU share, provided
-/// it shows at least half a percent of a core and out-ranks the next
+/// it shows at least a tenth of a percent of a core and out-ranks the next
 /// candidate two to one (or is the only one). A process encoding command
 /// buffers is never fully asleep, so the floor separates a model runtime
-/// from a GPU owned by a game or a video. The two-to-one margin is the
+/// from a GPU owned by a game or a video. Measured on the owner's 16 GB
+/// Mac: sd.cpp generating on Metal reads 0.004 of a core; idle runtimes
+/// read 0.000. The floor was 0.005 at first and missed the generation by
+/// a thousandth. The two-to-one margin is the
 /// false-positive guard: with Real-ESRGAN upscaling in another process at
 /// 100 % GPU while sd.cpp sat idle, the upscaler out-ranks sd.cpp and gets
 /// the credit (or crosses the quarter-core line on its own); two candidates
@@ -210,7 +213,7 @@ nonisolated struct CPUActivity: Sendable {
     static let busyGPUFraction = 0.8
     /// A runtime driving the GPU still shows at least this share of a core;
     /// below it the GPU belongs to something that holds no model.
-    static let gpuCompanionCoreFraction = 0.005
+    static let gpuCompanionCoreFraction = 0.001
     /// The GPU goes to the top candidate only when its share is at least
     /// this many times the next one's.
     static let gpuLeadFactor = 2.0
