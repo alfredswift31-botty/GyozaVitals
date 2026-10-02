@@ -708,8 +708,9 @@ struct CPUActivityTests {
     @Test func machTimeConverts() {
         #expect(MachTime.seconds(0) == 0)
         #expect(MachTime.seconds(1_000_000_000) > 0)
-        // Whatever the timebase, a billion ticks is between a few ms and a few s.
-        #expect((0.001...10).contains(MachTime.seconds(1_000_000_000)))
+        // A tick is 1 ns on Intel and 125/3 ns on Apple silicon: a billion
+        // ticks is 1 s or 41.7 s.
+        #expect((0.5...60).contains(MachTime.seconds(1_000_000_000)))
     }
 }
 
