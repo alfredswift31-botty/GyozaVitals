@@ -739,24 +739,24 @@ struct ScanAssemblyTests {
 
     @Test func busyRuntimeWithoutAnAPIMarksEveryFileExecuting() {
         let draft = Self.sdDraft()
-        let working = [300: CPUActivity.Delta(cpuSeconds: 4.5, wallSeconds: 5)]
+        let working: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 4.5, wallSeconds: 5)]
         let busy = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
                                          cpuDeltas: working, selfPID: 1).result
         #expect(busy.runtimes.count == 1)
         #expect(busy.runtimes.first?.isBusy == true)
         #expect(busy.models.count == Self.sdFiles.count)
-        #expect(busy.models.allSatisfy { $0.state == .executing })
+        #expect(busy.models.allSatisfy { $0.state == ModelState.executing })
 
-        let resting = [300: CPUActivity.Delta(cpuSeconds: 0.1, wallSeconds: 5)]
+        let resting: [pid_t: CPUActivity.Delta] = [300: CPUActivity.Delta(cpuSeconds: 0.1, wallSeconds: 5)]
         let idle = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
                                          cpuDeltas: resting, selfPID: 1).result
         #expect(idle.runtimes.first?.isBusy == false)
-        #expect(idle.models.allSatisfy { $0.state == .idle })
+        #expect(idle.models.allSatisfy { $0.state == ModelState.idle })
 
         let first = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: [:],
                                           cpuDeltas: [:], selfPID: 1).result
         #expect(first.runtimes.first?.isBusy == nil, "no previous sample: unknown")
-        #expect(first.models.allSatisfy { $0.state == .idle })
+        #expect(first.models.allSatisfy { $0.state == ModelState.idle })
     }
 
     @Test func anAPIAnswerIsNeverOverriddenAndLoadingStaysLoading() {
@@ -767,7 +767,7 @@ struct ScanAssemblyTests {
             LoadedModel(id: "400:\(name)", name: name, filePath: nil, runtime: .llamaServer, pid: 400, sizeBytes: 1, device: .gpu,
                         contextLength: nil, expiresAt: nil, state: state, role: .text, clients: [], firstSeen: Date())
         }
-        let working = [400: CPUActivity.Delta(cpuSeconds: 5, wallSeconds: 5)]
+        let working: [pid_t: CPUActivity.Delta] = [400: CPUActivity.Delta(cpuSeconds: 5, wallSeconds: 5)]
 
         let answered = ScanPipeline.assemble(
             drafts: [draft], results: [400: ProbeResult(version: "b1", isBusy: false, models: [model("a", .idle)])],
@@ -779,7 +779,7 @@ struct ScanAssemblyTests {
             drafts: [draft], results: [400: ProbeResult(version: nil, isBusy: nil, models: [model("a", .idle), model("b", .loading)])],
             manifests: [:], connections: [:], processes: [:], cpuDeltas: working, selfPID: 1).result
         #expect(silent.runtimes.first?.isBusy == true)
-        #expect(silent.models.map(\.state) == [.executing, .loading], "idle becomes executing; loading stays")
+        #expect(silent.models.map(\.state) == [ModelState.executing, ModelState.loading], "idle becomes executing; loading stays")
     }
 
     @Test func ollamaWithNoModelsIsStillARuntime() {
