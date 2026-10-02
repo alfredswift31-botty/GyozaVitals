@@ -8,6 +8,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 |---|---|---|
 | 1.0 | 2026-10-02 | [v1.0](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0) |
 | 1.0.1 | 2026-10-02 | [v1.0.1](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.1) |
+| 1.0.2 | 2026-10-02 | [v1.0.2](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.2) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -67,12 +68,15 @@ Four things were wrong, all fixed:
 
 Still unverified on CI (no sd.cpp there): the 0.25-core busy threshold under real Metal inference, and the Qwen Image helper tree's actual names. The user's next look at the popover during a generation is the check.
 
-## Scanner fixes from the second real run (2 Oct 2026, branch fix/scanner2)
+## 1.0.2: the second real run (2 Oct 2026)
+Two screenshots from the user: the prompt helper working (Ollama's Qwen3-VL) and an image generating (sd.cpp). Verified from them: helper processes collapse to "Qwen Image"; the legend matches the bar; no fake activity at launch; "used by Qwen Image" on an Ollama model (the prompt helper calls Ollama). Also learned: the Real-ESRGAN upscale runs in a different process from sd.cpp, so the 1.0.1 CPU heuristic was right not to mark sd.cpp busy during it.
+
 The owner's 16 GB Mac under 7 GB of swap, Qwen Image (sd.cpp) generating and Ollama holding Qwen3-VL. Three scanner defects:
 
 - **The same Ollama model twice.** Root cause: `/api/ps` reports the model's *manifest* digest (the ID `ollama list` shows), while the runner's `--model` blob is named by the `image.model` *layer* digest. `OllamaProbe.assemble` matched the two by digest, which never succeeds, so every listed model came out twice: once from the API entry (idle) and once as an "unlisted runner" (loading), both with the id `"<server pid>:<name>"` because the manifest index resolves the blob to the same name. Hence one "loaded" event and two "evicted". Now an entry is matched to its runner by the manifest name of the runner's blob (normalised: no registry, no `library/`, `:latest` implied) and, when one entry and one runner remain, by elimination; two child processes on one blob (an `ollama runner` and a `llama-server`, or a runner being replaced) collapse to the one that listens; the server's own mapping of a blob never makes a model; an unlisted runner that answers `/slots` is serving, not loading.
 - **"loading" for a model serving requests.** Under memory pressure `/api/ps` outran the 1.5 s GET timeout and the picture fell back to the runner. GETs now time out at 4 s (`HTTPClient.defaultTimeout`; the per-probe deadline is 5 s, still off the main actor), and `ScanPipeline` keeps the API's last answer per model id (`apiModels`): when a probe fails or times out while its process is still there, the fallback's models take the remembered name (so the id), device, context, role, size and unload time, and are never `.loading` unless the process holding the model is younger than 20 s.
 - **No "executing" on Metal-bound generation.** sd.cpp at 96 % GPU stayed under a quarter of a core. `VitalsStore` hands the latest system GPU utilisation to the scanner (`ModelScanSource.noteSystemGPU`, a default no-op) and `CPUActivity.busy(cpuShare:gpuUtilization:gpuCandidates:)` adds: GPU ≥ 80 % and the runtime at ≥ 3 % of a core and it is the only GPU-using runtime whose busy state no API gave. The last condition is the guard for the earlier false positive (Real-ESRGAN upscaling in another process at 100 % GPU while sd.cpp idled: two candidates, neither credited).
+- The memory line now says "models resident": the footprint counts only touched pages, so a freshly mapped file reads small until it is used (1.5 GB right after sd.cpp restarted, 6 GB after a generation).
 - Also: upscalers and face restorers (`esrgan`, `realesr`, `upscal`, `gfpgan`, `codeformer`, a `4x`/`2x` word) pass the generic weights filter at 32 MB instead of 100 MB, so a 64 MB RealESRGAN_x4plus.pth shows up as an `.unknown` runtime with role `.upscaler` and gets the busy heuristic.
 
 Unverifiable on CI (no runtimes there): the 4 s timeout against a pressured Ollama, the 3 % companion floor on real Metal work, and whether Ollama's process tree on the owner's version matches the fixtures (`llama-server` child for GGUF, `ollama runner` for the engine's own).
