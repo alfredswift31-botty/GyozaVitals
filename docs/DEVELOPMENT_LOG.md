@@ -132,19 +132,20 @@ The end-to-end test spawns `curl` against a listener in the test process that an
 
 One more measurement from CI, on the first develop run: a 5 ms tick can see a spawned child before its exec has completed, so the ledger recorded `curl` under the test process's own name and path. Attribution did not care (it walks pids), but the diagnostics name would have been the parent's. A newborn is now re-read on the following ticks for 50 ms and the later image wins.
 
-## Where things stand (end of 2 Oct 2026)
+## Where things stand (end of 5 Oct 2026)
 **Origin.** GyozaVitals was #4 on a list of twelve project ideas built from the models already on the user's Mac (see `docs/PROJECT-IDEAS.md` in the GyozaIsland repo). It was picked first because it is small and because every other local-model project on the list would hit the same RAM collisions it makes visible.
 
-**Verified on the user's 16 GB Mac (macOS 27):** models from sd.cpp, whisper.cpp and Ollama with correct names, sizes and devices; "used by" collapsed to the app name; one row per Ollama model with a live unload countdown; the memory bar and legend; "models resident"; headroom; pressure history; CPU with P/E split; GPU; thermal; power; the activity log seeded silently; the menu-bar glyph and number; the red dot on sd.cpp during a Metal generation (1.0.4); the Diagnostics pane.
+**Verified on the user's 16 GB Mac (macOS 27):** models from sd.cpp, whisper.cpp and Ollama with correct names, sizes and devices; one row per Ollama model with a live unload countdown; the memory bar and legend summing to the machine; "models resident"; headroom; pressure history; CPU with P/E split; GPU; thermal; power; the activity log seeded silently, with Ollama loads and evictions timed; the menu-bar glyph and number; the red dot on sd.cpp during a Metal generation (1.0.4); the Diagnostics pane; and, with 1.0.8, `sd.cpp · gpu · Qwen Image` on all four sd.cpp rows during a generation, the app named through the TCP table and the newborn ledger although it never holds a connection and launchd started the server.
 
-**Not yet seen working:** Ollama's own red dot while a request runs (same heuristic, untested on a real run); koboldcpp, llama-server, LM Studio, ComfyUI and mflux detection (none running on the user's Mac that day); energy use over an hour; the P/E-core index assumption.
+**Not yet seen working:** Ollama's own red dot while a request runs (same heuristic, untested on a real run); koboldcpp, llama-server, LM Studio, ComfyUI and mflux detection (none running on the user's Mac); energy use over an hour; the P/E-core index assumption.
 
 **Lessons.**
 - The first real run found what no test could: the user's image app runs sd.cpp, not ComfyUI; Ollama's API names a model by its manifest digest while the runner holds the layer digest; helper processes own the sockets, not the app.
 - A heuristic tuned from outside the app is a guess. The busy rule took three releases until the Diagnostics pane showed the actual number (0.004 against a 0.005 floor). Instrument first, then tune.
-- Read-only was the right call for 1.0: the app ran beside a two-hour generation on a swapping machine and never got in its way.
+- "Used by" took four releases (1.0.5 to 1.0.8) for one reason: the first three were reasoned from a model of the Mac, not measured on it. Two lines of `ps` and `netstat` from the user were worth more than all three. The test that passed for 1.0.7 held a connection open for 150 ms, which no real poller does; a test that confirms the design instead of challenging it is a liability.
+- Read-only was the right call for 1.0: the app ran beside two-hour generations on a swapping machine and never got in its way.
 
-**1.1 candidates, in order of value:** unload buttons behind a confirmation (Ollama `keep_alive: 0`); a notification when pressure goes critical while a model is executing; a 1024 px icon source; per-model attribution for Ollama once its API exposes it; SMC fans and watts.
+**1.1 candidates, in order of value:** unload buttons behind a confirmation (Ollama `keep_alive: 0`); a notification when pressure goes critical while a model is executing; the TCP table as the single source for live connections too (it would retire the per-process descriptor walk); a 1024 px icon source; per-model attribution for Ollama once its API exposes it; SMC fans and watts.
 
 ## Working notes
 - Work goes on `develop`; releases come from `main`.
