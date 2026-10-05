@@ -60,9 +60,11 @@ jobs:
 
       # The snapshot tests render the real views in light and dark. CI prints
       # them as base64 JPEGs so a design change can be reviewed from the log.
-      - name: Collect UI snapshots
+      - name: Collect UI snapshots and measurements
         if: always()
         run: |
+          echo "== Measurements from the real tests =="
+          find "$HOME/Library/Containers" "$TMPDIR" -path '*gyozavitals-measurements*' -name '*.txt' -exec cat {} \; 2>/dev/null || true
           mkdir -p ui-snapshots
           find "$HOME/Library/Containers" "$TMPDIR" -path '*ui-snapshots*' -name '*.png' -exec cp {} ui-snapshots/ \; 2>/dev/null || true
           ls -la ui-snapshots

@@ -722,41 +722,6 @@ struct CPUActivityTests {
         #expect(activity.observe([Self.record(10, cpu: 3.1)], at: 114)[10] == nil)
     }
 
-    @Test func thisProcessReadsAsBusyWhileBurningAndIdleAfter() throws {
-        func sample() -> (cpu: Double, wall: TimeInterval) {
-            (ProcessList.cpuSeconds(getpid()) ?? -1, ProcessInfo.processInfo.systemUptime)
-        }
-        let before = sample()
-        #expect(before.cpu >= 0, "rusage of our own process is always readable")
-
-        // Two threads spin for 0.6 s: well over a quarter of one core.
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.6
-        let threads = (0..<2).map { _ in
-            Thread {
-                var x = 0.0
-                while ProcessInfo.processInfo.systemUptime < deadline { x = (x + 1.0).squareRoot() }
-                _ = x
-            }
-        }
-        threads.forEach { $0.start() }
-        Thread.sleep(forTimeInterval: 0.65)
-        let burnt = sample()
-        #expect(burnt.cpu > before.cpu)
-        #expect(CPUActivity.busy(cpuDelta: burnt.cpu - before.cpu, wallDelta: burnt.wall - before.wall) == true)
-
-        // Then quiet. Other tests may run in parallel in this process, so up
-        // to three 0.3 s windows get a chance to read idle.
-        var idle = false
-        var last = burnt
-        for _ in 0..<3 where !idle {
-            Thread.sleep(forTimeInterval: 0.3)
-            let now = sample()
-            idle = CPUActivity.busy(cpuDelta: now.cpu - last.cpu, wallDelta: now.wall - last.wall) == false
-            last = now
-        }
-        #expect(idle, "the process never read as idle after the burn")
-    }
-
     @Test func machTimeConverts() {
         #expect(MachTime.seconds(0) == 0)
         #expect(MachTime.seconds(1_000_000_000) > 0)
@@ -1321,136 +1286,24 @@ struct UpscalerFileTests {
     }
 }
 
-// MARK: - Poller catcher: clients that live for milliseconds
+// MARK: - Pollers: the TCP table remembers the dead, the ledger knows their parents
 
 struct PollerCatcherTests {
-    /// A loopback listener that accepts in the background and hangs up a
-    /// moment later, so curl neither stalls on its request nor vanishes
-    /// between the catcher's ticks.
-    private final class Listener: @unchecked Sendable {
-        let fd: Int32
-        let port: Int
-
-        init() throws {
-            let server = socket(AF_INET, SOCK_STREAM, 0)
-            try #require(server >= 0)
-            var address = sockaddr_in()
-            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            address.sin_family = sa_family_t(AF_INET)
-            address.sin_port = 0
-            address.sin_addr.s_addr = UInt32(0x7f00_0001).bigEndian
-            let size = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let bound = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(server, $0, size) }
-            }
-            try #require(bound == 0)
-            try #require(listen(server, 8) == 0)
-            var length = size
-            let named = withUnsafeMutablePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(server, $0, &length) }
-            }
-            try #require(named == 0)
-            let port = Int(UInt16(bigEndian: address.sin_port))
-            try #require(port > 0)
-            self.fd = server
-            self.port = port
-            Thread {
-                while true {
-                    let connection = accept(server, nil, nil)
-                    guard connection >= 0 else { break }
-                    usleep(150_000)
-                    close(connection)
-                }
-            }.start()
-        }
-
-        func stop() {
-            shutdown(fd, SHUT_RDWR)
-            close(fd)
-        }
-    }
-
-    /// Fire and forget: curl connects, sends its request and exits when the
-    /// listener hangs up (or after 2 s). It is never signalled.
-    private static func spawnCurl(port: Int) throws -> Process {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        process.arguments = ["-s", "-m", "2", "http://127.0.0.1:\(port)/"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        return process
-    }
-
-    /// One burst of a second, with three curls spawned 200, 300 and 400 ms in.
-    private static func burst(_ catcher: PollerCatcher, port: Int, processes byPID: [pid_t: ProcessRecord]) async throws -> [CaughtPoller] {
-        let known = Set(ProcessList.allPIDs())
-        async let caught = catcher.catchPollers(ports: [port], among: known, processes: byPID, duration: 1.0)
-        try await Task.sleep(for: .milliseconds(200))
-        var curls: [Process] = []
-        for _ in 0..<3 {
-            curls.append(try spawnCurl(port: port))
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        let result = await caught
-        withExtendedLifetime(curls) {}
-        return result
-    }
-
-    @Test func catchesCurlConnectingToOurListener() async throws {
-        let listener = try Listener()
-        defer { listener.stop() }
-        let byPID = Dictionary(ProcessList.currentUserProcesses().map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
-        let catcher = PollerCatcher()
-        var caught = try await Self.burst(catcher, port: listener.port, processes: byPID)
-        // CI runners are slow; one more try before giving up.
-        if !caught.contains(where: { $0.name == "curl" }) { caught = try await Self.burst(catcher, port: listener.port, processes: byPID) }
-        let curl = try #require(caught.first { $0.name == "curl" }, "caught: \(caught)")
-        #expect(curl.port == listener.port)
-        #expect(curl.parentPID == getpid())
-        #expect(curl.executablePath?.hasSuffix("/curl") == true)
-        #expect(curl.chain.first?.pid == curl.pid)
-        #expect(curl.chain.first?.name == "curl")
-        #expect(curl.chain.dropFirst().first?.pid == getpid(), "chain: \(curl.chain.map(\.pid))")
-        #expect(caught.allSatisfy { $0.port == listener.port })
-        #expect(!caught.contains { $0.pid == getpid() }, "the test process itself is known, never a newborn")
-    }
-
-    @Test func nothingIsCaughtWithoutPortsOrConnections() async {
-        let catcher = PollerCatcher()
-        let none = await catcher.catchPollers(ports: [], among: [], duration: 1)
-        #expect(none.isEmpty)
-        // An unused port, a very short burst: whatever is born connects elsewhere.
-        let quiet = await catcher.catchPollers(ports: [1], among: Set(ProcessList.allPIDs()), duration: 0.1)
-        #expect(quiet.isEmpty)
-    }
-
-    @Test func aSocketMatchesInAnyStateButListening() {
-        let ports: Set<Int> = [1235]
-        func tcp(_ state: TCPSocket.State, remote: Int, loopback: Bool = true) -> TCPSocket {
-            TCPSocket(state: state, localPort: 50_000, remotePort: remote, localIsLoopback: loopback, remoteIsLoopback: loopback)
-        }
-        #expect(PollerCatcher.matches(tcp(.established, remote: 1235), ports: ports))
-        #expect(PollerCatcher.matches(tcp(.other, remote: 1235), ports: ports), "SYN_SENT and CLOSE_WAIT count")
-        #expect(!PollerCatcher.matches(tcp(.listening, remote: 0), ports: ports))
-        #expect(!PollerCatcher.matches(tcp(.established, remote: 443), ports: ports))
-        #expect(!PollerCatcher.matches(tcp(.established, remote: 1235, loopback: false), ports: ports))
-    }
-
-    @Test func theBurstRuleNeedsPortsNoClientBusyAndACooldown() {
+    @Test func theBurstRuleNeedsPortsAnUnexplainedDeadClientAndACooldown() {
         let now = Date()
-        let table: [(ports: Set<Int>, hasClient: Bool, isBusy: Bool, lastBurst: Date?, expected: Bool, why: String)] = [
-            ([1235], false, true, nil, true, "busy, listening, nobody seen: burst"),
-            ([], false, true, nil, false, "no port: nothing to connect to"),
-            ([1235], true, true, nil, false, "a connection or launcher already names the client"),
-            ([1235], false, false, nil, false, "idle: no polls to catch"),
-            ([1235], false, true, now.addingTimeInterval(-10), false, "watched 10 s ago: sticky clients still hold"),
-            ([1235], false, true, now.addingTimeInterval(-ScanPipeline.burstCooldown), true, "the cooldown is over"),
+        let table: [(ports: Set<Int>, unexplained: Int, lastBurst: Date?, expected: Bool, why: String)] = [
+            ([1235], 1, nil, true, "a dead client nobody can explain: burst"),
+            ([], 1, nil, false, "no port: nothing to connect to"),
+            ([1235], 0, nil, false, "no dead client, or every one is in the ledger: nothing to learn"),
+            ([1235], 3, now.addingTimeInterval(-10), false, "watched 10 s ago: the ledger and sticky clients still hold"),
+            ([1235], 1, now.addingTimeInterval(-ScanPipeline.burstCooldown), true, "the cooldown is over"),
         ]
         for row in table {
-            let decision = ScanPipeline.shouldBurst(ports: row.ports, hasClient: row.hasClient, isBusy: row.isBusy, lastBurst: row.lastBurst, now: now)
+            let decision = ScanPipeline.shouldBurst(ports: row.ports, unexplainedDead: row.unexplained, lastBurst: row.lastBurst, now: now)
             #expect(decision == row.expected, Comment(rawValue: row.why))
         }
+        #expect(ScanPipeline.burstCooldown >= 30)
+        #expect(NewbornLedger.memory > StickyClients.memory, "a catch outlives the client it explains")
     }
 
     static func sdServer() -> RuntimeDraft {
@@ -1460,27 +1313,139 @@ struct PollerCatcherTests {
         return RuntimeDraft(kind: .sdcpp, process: sd, helpers: [], probePort: 1235)
     }
 
-    @Test func pollersAreHandedToTheRuntimeOnTheirPort() {
+    static func timeWait(to port: Int, from pid: pid_t, loopback: Bool = true) -> TCPTableEntry {
+        TCPTableEntry(state: .timeWait, localPort: 50_000 + Int(pid % 10_000), remotePort: port, localIsLoopback: loopback,
+                      remoteIsLoopback: loopback, lastPID: pid, effectivePID: pid)
+    }
+
+    static func record(_ pid: pid_t, parent: pid_t, _ name: String, _ path: String, arguments: [String]? = nil) -> ProcessRecord {
+        ProcessRecord(pid: pid, parentPID: parent, uid: 501, name: name, executablePath: path, arguments: arguments ?? [path],
+                      startTime: 1_790_000_000, footprintBytes: 1)
+    }
+
+    @Test func tableClientsGoToTheRuntimeOnTheirPortEachPidOnce() {
         let sd = Self.sdServer()
         let other = ScanAssemblyTests.process(400, "llama-server", "/opt/homebrew/bin/llama-server", ["llama-server"],
                                               kind: Classification(.llamaServer), ports: [8080])
         let llama = RuntimeDraft(kind: .llamaServer, process: other, helpers: [], probePort: 8080)
-        let a = CaughtPoller(pid: 1, name: "curl", executablePath: nil, parentPID: 50, port: 1235, chain: [])
-        let b = CaughtPoller(pid: 2, name: "curl", executablePath: nil, parentPID: 50, port: 8080, chain: [])
-        let stray = CaughtPoller(pid: 3, name: "curl", executablePath: nil, parentPID: 50, port: 9, chain: [])
-        let byRuntime = ScanPipeline.pollers([a, b, stray], for: [sd, llama])
-        #expect(byRuntime[300]?.map(\.pid) == [1])
-        #expect(byRuntime[400]?.map(\.pid) == [2])
-        #expect(byRuntime.count == 2)
+        let app = Self.record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
+        let script = Self.record(60, parent: 1, "python3", "/usr/bin/python3", arguments: ["python3", "poll.py"])
+        let tool = Self.record(61, parent: 50, "curl", "/usr/bin/curl")
+        let byPID = Dictionary(uniqueKeysWithValues: [sd.process.record, other.record, app, script, tool].map { ($0.pid, $0) })
+        var ledger = NewbornLedger()
+        ledger.remember(Newborn(pid: 900, parentPID: 50, name: "curl", executablePath: "/usr/bin/curl", bornAt: Date()))
+        let table = [
+            Self.timeWait(to: 1235, from: 60), Self.timeWait(to: 1235, from: 60), // one live pid, two polls: one poller
+            Self.timeWait(to: 8080, from: 61), // connected now as well: counted there, not here
+            Self.timeWait(to: 1235, from: 900), // dead, in the ledger
+            Self.timeWait(to: 1235, from: 901), // dead, unknown
+            Self.timeWait(to: 1235, from: 300), // the server's own
+            Self.timeWait(to: 1235, from: 1), // this app's probe (selfPID 1 here)
+            Self.timeWait(to: 1235, from: 902, loopback: false), // over the LAN: not ours to say
+            Self.timeWait(to: 9, from: 903), // some other port
+            TCPTableEntry(state: .listening, localPort: 1235, remotePort: 0, localIsLoopback: true, remoteIsLoopback: false,
+                          lastPID: 300, effectivePID: 300),
+        ]
+        let forSD = ScanPipeline.tableClients(for: sd, table: table, processes: byPID, ledger: ledger, connections: [:], excluding: [300, 1])
+        #expect(forSD.pollers.map(\.pid) == [60, 900])
+        #expect(forSD.pollers.first?.name == "python3 poll.py")
+        #expect(forSD.pollers.first?.chain.map(\.pid) == [60])
+        #expect(forSD.pollers.last?.chain.map(\.pid) == [900, 50], "a dead curl's chain goes through the ledger to the live app")
+        #expect(forSD.evidence == ScanPipeline.TableEvidence(ports: [1235], connections: 4, dead: 2, inLedger: 1))
+        #expect(forSD.evidence.unexplained == 1)
+        #expect(forSD.evidence.note == "table: 4 to :1235, 2 dead, 1 in ledger")
+
+        let forLlama = ScanPipeline.tableClients(for: llama, table: table, processes: byPID, ledger: ledger,
+                                                 connections: [8080: [tool]], excluding: [400, 1])
+        #expect(forLlama.pollers.isEmpty, "a process with a connection open now is a connection, not a poller")
+        #expect(forLlama.evidence.connections == 1)
+        #expect(forLlama.evidence.note == "table: 1 to :8080, 0 dead, 0 in ledger")
+        let asPoller = ScanPipeline.tableClients(for: llama, table: table, processes: byPID, ledger: ledger, connections: [:], excluding: [400, 1])
+        #expect(asPoller.pollers.map(\.pid) == [61])
+        #expect(asPoller.pollers.first?.chain.map(\.pid) == [61, 50])
+        #expect(ScanPipeline.TableEvidence().note == nil)
     }
 
-    /// The owner's case: sd-server under launchd, no connection at the scan
-    /// instant, a helper per progress poll. The caught helper is a client,
-    /// its chain resolves to the app, and sticky memory keeps it.
+    @Test func aDeadChainSkipsItsWrapperShellButKeepsItself() {
+        let app = Self.record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
+        let byPID = [app.pid: app]
+        let now = Date()
+        var ledger = NewbornLedger()
+        ledger.remember(Newborn(pid: 38384, parentPID: 50, name: "sh", executablePath: "/bin/sh", bornAt: now))
+        ledger.remember(Newborn(pid: 38385, parentPID: 38384, name: "curl", executablePath: "/usr/bin/curl", bornAt: now))
+        ledger.remember(Newborn(pid: 38390, parentPID: 38384, name: "", executablePath: nil, bornAt: now))
+        ledger.remember(Newborn(pid: 38395, parentPID: 38394, name: "curl", executablePath: "/usr/bin/curl", bornAt: now))
+        #expect(ScanPipeline.chain(fromDead: 38385, ledger: ledger, among: byPID).map(\.pid) == [38385, 50])
+        #expect(ScanPipeline.chain(fromDead: 38385, ledger: ledger, among: byPID).map(\.name) == ["curl", "Qwen Image"])
+        #expect(ScanPipeline.chain(fromDead: 38384, ledger: ledger, among: byPID).map(\.pid) == [38384, 50], "the shell itself stays as the first link")
+        #expect(ScanPipeline.chain(fromDead: 38390, ledger: ledger, among: byPID).map(\.name) == ["helper", "Qwen Image"])
+        #expect(ScanPipeline.chain(fromDead: 38395, ledger: ledger, among: byPID).map(\.pid) == [38395], "an unknown parent ends the walk")
+        #expect(ScanPipeline.chain(fromDead: 40000, ledger: ledger, among: byPID).isEmpty)
+    }
+
+    /// The owner's case, as measured: sd-server under launchd, the table
+    /// full of TIME_WAIT connections to :1235 from pids that have exited,
+    /// a burst that saw some of them born under a `sh -c` of Qwen Image.
+    /// The runtime's clients resolve to the app, and the note says what
+    /// the table, the ledger and the burst had.
+    @Test func aDeadPollerResolvesThroughTheLedgerToItsApp() throws {
+        let draft = Self.sdServer()
+        let app = Self.record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
+        let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app].map { ($0.pid, $0) })
+        let born = Date()
+        var ledger = NewbornLedger()
+        ledger.remember(Newborn(pid: 38384, parentPID: 50, name: "sh", executablePath: "/bin/sh", bornAt: born))
+        ledger.remember(Newborn(pid: 38385, parentPID: 38384, name: "curl", executablePath: "/usr/bin/curl", bornAt: born))
+        ledger.remember(Newborn(pid: 38396, parentPID: 50, name: "sh", executablePath: "/bin/sh", bornAt: born))
+        ledger.remember(Newborn(pid: 38397, parentPID: 38396, name: "curl", executablePath: "/usr/bin/curl", bornAt: born))
+        let table = [
+            Self.timeWait(to: 1235, from: 38385), Self.timeWait(to: 1235, from: 38397), // dead, in the ledger
+            Self.timeWait(to: 1235, from: 38410), // dead, born before the burst
+            Self.timeWait(to: 1235, from: 300), Self.timeWait(to: 1235, from: 1), // the server's own, this app's probe
+        ]
+        let burstAt = born.addingTimeInterval(-2)
+        let output = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: byPID,
+                                           cpuDeltas: [:], selfPID: 1, table: table, ledger: ledger,
+                                           bursts: [300: BurstRecord(at: burstAt, born: 7, cpuSeconds: 0.0226)])
+        let runtime = try #require(output.result.runtimes.first)
+        #expect(Set(runtime.clients.map(\.pid)) == [38385, 38397])
+        #expect(runtime.clients.allSatisfy { $0.name == "curl" })
+        #expect(runtime.attributionNote
+            == "caught 1 poller (Qwen Image) · table: 3 to :1235, 3 dead, 2 in ledger · burst \(Formatting.clockWithSeconds(burstAt)), 7 born, 23 ms")
+        #expect(output.clientChains[38385]?.map(\.pid) == [38385, 50], "the dead shell is left out of the chain")
+        #expect(output.clientChains[38397]?.map(\.pid) == [38397, 50])
+        #expect(output.clientChains[38410] == nil, "a dead pid the ledger never saw is evidence, not a client")
+        #expect(output.result.models.count == ScanAssemblyTests.sdFiles.count)
+        #expect(output.result.models.allSatisfy { Set($0.clients.map(\.pid)) == [38385, 38397] })
+
+        // The main actor's resolution, without NSRunningApplication: the chain names the app, once.
+        let resolved = ClientFinder.dedupe(runtime.clients.map { client in
+            ClientFinder.resolveApp(chain: output.clientChains[client.pid] ?? []) ?? ResolvedClient(app: client, isHelper: false)
+        })
+        #expect(resolved.map(\.name) == ["Qwen Image"])
+        #expect(resolved.first?.pid == 50)
+
+        // The one unexplained dead pid is the reason for the next burst.
+        let evidence = ScanPipeline.tableClients(for: draft, table: table, processes: byPID, ledger: ledger, connections: [:],
+                                                 excluding: [300, 1]).evidence
+        #expect(evidence.unexplained == 1)
+        #expect(ScanPipeline.shouldBurst(ports: draft.allListeningPorts, unexplainedDead: evidence.unexplained, lastBurst: nil, now: Date()))
+        #expect(!ScanPipeline.shouldBurst(ports: draft.allListeningPorts, unexplainedDead: evidence.unexplained, lastBurst: Date(), now: Date()))
+
+        // Between bursts, the catch stays for a minute.
+        var sticky = StickyClients()
+        let now = Date()
+        let shown = sticky.update(pid: 300, seen: resolved, now: now)
+        #expect(shown.map(\.name) == ["Qwen Image"])
+        #expect(sticky.update(pid: 300, seen: [], now: now.addingTimeInterval(45)) == shown)
+        #expect(sticky.update(pid: 300, seen: [], now: now.addingTimeInterval(61)).isEmpty)
+    }
+
+    /// A poller handed in already chained (as 1.0.7's catcher did) still
+    /// goes through the same rules: the server's own worker is no client.
     @Test func aCaughtPollerBecomesAClientOfItsRuntime() throws {
         let draft = Self.sdServer()
-        let app = ProcessRecord(pid: 50, parentPID: 1, uid: 501, name: "Qwen Image", executablePath: ClientResolutionTests.qwen,
-                                arguments: [ClientResolutionTests.qwen], startTime: 1_790_000_000, footprintBytes: 1)
+        let app = Self.record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
         let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app].map { ($0.pid, $0) })
         let helper = CaughtPoller(pid: 38385, name: "curl", executablePath: "/usr/bin/curl", parentPID: 50, port: 1235,
                                   chain: [ProcessChainLink(pid: 38385, name: "curl", executablePath: "/usr/bin/curl"), ProcessChainLink(app)])
@@ -1493,38 +1458,29 @@ struct PollerCatcherTests {
         let runtime = try #require(output.result.runtimes.first)
         #expect(runtime.clients.map(\.pid) == [38385])
         #expect(runtime.clients.first?.name == "curl")
-        #expect(runtime.attributionNote == "caught 1 poller")
+        #expect(runtime.attributionNote == "caught 1 poller (Qwen Image)")
         #expect(output.clientChains[38385]?.map(\.pid) == [38385, 50])
         #expect(output.clientChains[301] == nil)
-        #expect(output.result.models.count == ScanAssemblyTests.sdFiles.count)
         #expect(output.result.models.allSatisfy { $0.clients.map(\.pid) == [38385] })
-
-        // The main actor's resolution, without NSRunningApplication: the chain names the app.
         let resolved = try #require(ClientFinder.resolveApp(chain: output.clientChains[38385] ?? []))
         #expect(resolved.app.name == "Qwen Image")
         #expect(resolved.app.pid == 50)
-
-        // Between bursts, the catch stays for a minute.
-        var sticky = StickyClients()
-        let now = Date()
-        let shown = sticky.update(pid: 300, seen: [resolved.app], now: now)
-        #expect(shown.map(\.name) == ["Qwen Image"])
-        #expect(sticky.update(pid: 300, seen: [], now: now.addingTimeInterval(45)) == shown)
-        #expect(sticky.update(pid: 300, seen: [], now: now.addingTimeInterval(61)).isEmpty)
     }
 
     @Test func theAttributionNoteNamesTheSources() {
-        // Nobody: launchd above, no connection, nothing caught.
+        // Nobody: launchd above, no connection, nothing in the table.
         let alone = ScanPipeline.assemble(drafts: [Self.sdServer()], results: [:], manifests: [:], connections: [:], processes: [:],
                                           cpuDeltas: [:], selfPID: 1)
         #expect(alone.result.runtimes.first?.attributionNote == "no client seen")
+        // A table with nothing to the runtime's ports leaves the wording alone.
+        let elsewhere = ScanPipeline.assemble(drafts: [Self.sdServer()], results: [:], manifests: [:], connections: [:], processes: [:],
+                                              cpuDeltas: [:], selfPID: 1, table: [Self.timeWait(to: 443, from: 77)])
+        #expect(elsewhere.result.runtimes.first?.attributionNote == "no client seen")
 
         // A connection and the launcher, as in 1.0.6.
         let draft = ScanAssemblyTests.sdDraft()
-        let app = ProcessRecord(pid: 50, parentPID: 1, uid: 501, name: "Qwen Image", executablePath: ClientResolutionTests.qwen,
-                                arguments: [ClientResolutionTests.qwen], startTime: 1_790_000_000, footprintBytes: 1)
-        let curl = ProcessRecord(pid: 900, parentPID: 1, uid: 501, name: "curl", executablePath: "/usr/bin/curl", arguments: ["curl"],
-                                 startTime: 1_790_000_000, footprintBytes: 1)
+        let app = Self.record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
+        let curl = Self.record(900, parent: 1, "curl", "/usr/bin/curl", arguments: ["curl"])
         let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app, curl].map { ($0.pid, $0) })
         let both = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [7860: [curl]], processes: byPID,
                                          cpuDeltas: [:], selfPID: 1)
@@ -1533,8 +1489,251 @@ struct PollerCatcherTests {
         // A poller already connected is counted once, as a connection.
         let poller = CaughtPoller(pid: 900, name: "curl", executablePath: "/usr/bin/curl", parentPID: 1, port: 7860, chain: [])
         let once = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [7860: [curl]], processes: byPID,
-                                         cpuDeltas: [:], selfPID: 1, pollers: [300: [poller]])
-        #expect(once.result.runtimes.first?.attributionNote == "1 connected, launcher")
+                                         cpuDeltas: [:], selfPID: 1, pollers: [300: [poller]], table: [Self.timeWait(to: 7860, from: 900)])
+        #expect(once.result.runtimes.first?.attributionNote == "1 connected, launcher · table: 1 to :7860, 0 dead, 0 in ledger")
         #expect(once.result.runtimes.first?.clients.map(\.pid) == [900, 50])
+
+        // Two dead helpers of one app, and a live script of its own: two pollers, named.
+        let script = Self.record(60, parent: 1, "python3", "/usr/bin/python3", arguments: ["python3", "poll.py"])
+        var ledger = NewbornLedger()
+        ledger.remember(Newborn(pid: 901, parentPID: 50, name: "curl", executablePath: "/usr/bin/curl", bornAt: Date()))
+        ledger.remember(Newborn(pid: 902, parentPID: 50, name: "curl", executablePath: "/usr/bin/curl", bornAt: Date()))
+        let named = ScanPipeline.assemble(drafts: [Self.sdServer()], results: [:], manifests: [:], connections: [:],
+                                          processes: [50: app, 60: script], cpuDeltas: [:], selfPID: 1,
+                                          table: [Self.timeWait(to: 1235, from: 60), Self.timeWait(to: 1235, from: 901), Self.timeWait(to: 1235, from: 902)],
+                                          ledger: ledger)
+        #expect(named.result.runtimes.first?.attributionNote == "caught 2 pollers (python3 poll.py, Qwen Image) · table: 3 to :1235, 2 dead, 2 in ledger")
+    }
+}
+
+// MARK: - Tests that drive this process, one at a time
+
+/// The tests that burn, listen, spawn or watch in this process run one at
+/// a time (serialization applies to the nested suites too), so a burn
+/// reads idle afterwards and a burst's ticks aren't crowded out by the
+/// snapshot renders and the real scan. Everything pure stays parallel.
+@Suite(.serialized)
+struct RealMachineTests {
+    struct CPUBurn {
+        @Test func thisProcessReadsAsBusyWhileBurningAndIdleAfter() throws {
+            func sample() -> (cpu: Double, wall: TimeInterval) {
+                (ProcessList.cpuSeconds(getpid()) ?? -1, ProcessInfo.processInfo.systemUptime)
+            }
+            let before = sample()
+            #expect(before.cpu >= 0, "rusage of our own process is always readable")
+
+            // Two threads spin for 0.6 s: well over a quarter of one core.
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.6
+            let threads = (0..<2).map { _ in
+                Thread {
+                    var x = 0.0
+                    while ProcessInfo.processInfo.systemUptime < deadline { x = (x + 1.0).squareRoot() }
+                    _ = x
+                }
+            }
+            threads.forEach { $0.start() }
+            Thread.sleep(forTimeInterval: 0.65)
+            let burnt = sample()
+            #expect(burnt.cpu > before.cpu)
+            #expect(CPUActivity.busy(cpuDelta: burnt.cpu - before.cpu, wallDelta: burnt.wall - before.wall) == true)
+
+            // Then quiet. Other tests may run in parallel in this process (the
+            // real scan, the snapshot renders, the newborn bursts), so up to
+            // ten 0.3 s windows get a chance to read idle.
+            var idle = false
+            var last = burnt
+            for _ in 0..<10 where !idle {
+                Thread.sleep(forTimeInterval: 0.3)
+                let now = sample()
+                idle = CPUActivity.busy(cpuDelta: now.cpu - last.cpu, wallDelta: now.wall - last.wall) == false
+                last = now
+            }
+            #expect(idle, "the process never read as idle after the burn")
+        }
+    }
+
+    struct KernelTable {
+        /// The real thing: a listener in this process, a client socket that
+        /// connects and is the first to hang up (the active closer goes to
+        /// TIME_WAIT), and the kernel's table still naming this process on the
+        /// closed connection.
+        @Test func theKernelTableNamesThisProcessOnItsListenerAndOnAClosedConnection() throws {
+            let listener = try LoopbackSockets.listen()
+            defer { close(listener.fd) }
+            let port = listener.port
+            let client = try LoopbackSockets.connect(to: port)
+            let accepted = accept(listener.fd, nil, nil)
+            try #require(accepted >= 0)
+
+            let live = TCPTable.read()
+            try #require(!live.isEmpty, "pcblist_n read nothing")
+            #expect(live.contains { $0.state == .listening && $0.localPort == port && $0.localIsLoopback && $0.lastPID == getpid() },
+                    "listener missing from: \(live.filter { $0.localPort == port || $0.remotePort == port })")
+            #expect(live.contains { $0.state == .established && $0.remotePort == port && $0.remoteIsLoopback && $0.lastPID == getpid() },
+                    "client missing from: \(live.filter { $0.remotePort == port })")
+
+            // The client closes first, then the server side: the client's half
+            // goes to TIME_WAIT and stays in the table for 2 MSL with its pid.
+            close(client)
+            close(accepted)
+            var closed: TCPTableEntry?
+            for _ in 0..<40 {
+                let rows = TCPTable.read().filter { $0.remotePort == port && $0.remoteIsLoopback && $0.state != .listening }
+                closed = rows.first { $0.state == .timeWait } ?? rows.first
+                if closed?.state == .timeWait { break }
+                usleep(50_000)
+            }
+            let entry = try #require(closed, "the closed connection vanished from the table")
+            Measurements.note("TCPTable: closed client connection read as \(entry.state), so_last_pid \(entry.lastPID), so_e_pid \(entry.effectivePID.map(String.init) ?? "none"); \(TCPTable.read().count) rows in the table")
+            #expect([.timeWait, .finWait2, .finWait1, .closing, .established, .closeWait].contains(entry.state),
+                    "a client that hung up first is in TIME_WAIT, or on its way there; got \(entry.state)")
+            #expect(entry.lastPID == getpid())
+            #expect(entry.effectivePID == nil || entry.effectivePID == getpid(), "so_e_pid is 0 unless the socket was delegated")
+            #expect(entry.remoteIsLoopback && entry.localIsLoopback)
+            #expect(entry.isClient(of: [port]))
+        }
+    }
+
+    struct Bursts {
+        /// A loopback HTTP listener that answers every connection with an empty
+        /// 200 and then waits for the client to hang up, as sd-server's
+        /// keep-alive does: the client is the active closer, so its half of the
+        /// connection is what stays in the kernel's table, in TIME_WAIT, with
+        /// the client's pid. Nothing is held open on purpose: curl reads its
+        /// answer and exits at once.
+        private final class Listener: @unchecked Sendable {
+            let fd: Int32
+            let port: Int
+
+            init() throws {
+                let listener = try LoopbackSockets.listen()
+                fd = listener.fd
+                port = listener.port
+                let server = fd
+                Thread {
+                    while true {
+                        let connection = accept(server, nil, nil)
+                        guard connection >= 0 else { break }
+                        let reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        _ = reply.withCString { send(connection, $0, strlen($0), 0) }
+                        var timeout = timeval(tv_sec: 3, tv_usec: 0)
+                        setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+                        var scratch = [UInt8](repeating: 0, count: 4096)
+                        while recv(connection, &scratch, 4096, 0) > 0 {}
+                        close(connection)
+                    }
+                }.start()
+            }
+
+            func stop() {
+                shutdown(fd, SHUT_RDWR)
+                close(fd)
+            }
+        }
+
+        /// Fire and forget: curl connects, reads its empty answer and exits (or
+        /// gives up after 2 s). It is never signalled.
+        private static func spawnCurl(port: Int) throws -> Process {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            process.arguments = ["-s", "-m", "2", "http://127.0.0.1:\(port)/"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            return process
+        }
+
+        /// The burst's cost is its own thread's CPU time, tick by tick: the
+        /// test process runs other suites in parallel, so process-wide CPU
+        /// says nothing about the burst (1.6 s of it on CI, for a burst that
+        /// cost a few tens of milliseconds).
+        @Test func aBurstListsNothingKnownAndCostsLittle() async {
+            let catcher = PollerCatcher()
+            let none = await catcher.watchNewborns(among: [], duration: 0)
+            #expect(none.newborns.isEmpty && none.ticks == 0)
+            let known = Set(ProcessList.allPIDs())
+            let started = Date()
+            let burst = await catcher.watchNewborns(among: known, duration: ScanPipeline.burstDuration)
+            let elapsed = Date().timeIntervalSince(started)
+            Measurements.note("PollerCatcher: quiet burst of \(ScanPipeline.burstDuration) s over \(known.count) pids: \(burst.ticks) ticks ending at \(Int(burst.interval * 1000)) ms, \(burst.newborns.count) newborns, \(Int(burst.cpuSeconds * 1000)) ms cpu, \(Int(elapsed * 1000)) ms wall")
+            #expect(!burst.newborns.contains { known.contains($0.pid) }, "nothing known is a newborn")
+            #expect(!burst.newborns.contains { $0.pid == getpid() })
+            #expect(burst.newborns.allSatisfy { $0.parentPID >= 0 && $0.bornAt >= started })
+            #expect(elapsed >= ScanPipeline.burstDuration)
+            #expect(burst.ticks >= 20, "5 to 20 ms ticks over 1.2 s, with the sleeps overrunning on a loaded runner; got \(burst.ticks)")
+            #expect(burst.interval >= 0.005 && burst.interval <= 0.02)
+            #expect(burst.cpuSeconds < 0.15, "the burst used \(burst.cpuSeconds) s of CPU")
+        }
+
+        /// The real thing, end to end: a listener in this process, a curl that
+        /// polls it once and exits, a burst running meanwhile that sees curl
+        /// being born, then the table-based attribution after curl is dead,
+        /// naming this process through the ledger.
+        @Test func aDeadCurlIsStillAttributedThroughTheTable() async throws {
+            let listener = try Listener()
+            defer { listener.stop() }
+            let byPID = Dictionary(ProcessList.currentUserProcesses().map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+            try #require(byPID[getpid()] != nil)
+            let catcher = PollerCatcher()
+
+            func attempt() async throws -> (curl: Process, burst: Burst) {
+                let known = Set(ProcessList.allPIDs())
+                async let burst = catcher.watchNewborns(among: known, duration: 1.0)
+                try await Task.sleep(for: .milliseconds(150))
+                let curl = try Self.spawnCurl(port: listener.port)
+                var waited = 0
+                while curl.isRunning, waited < 150 {
+                    try await Task.sleep(for: .milliseconds(20))
+                    waited += 1
+                }
+                return (curl, await burst)
+            }
+            var (curl, burst) = try await attempt()
+            // CI runners are slow; one more try before giving up.
+            if !burst.newborns.contains(where: { $0.pid == curl.processIdentifier }) { (curl, burst) = try await attempt() }
+            let newborns = burst.newborns
+            Measurements.note("PollerCatcher: burst of 1.0 s with a curl: \(burst.ticks) ticks ending at \(Int(burst.interval * 1000)) ms, \(newborns.count) newborns, \(Int(burst.cpuSeconds * 1000)) ms cpu")
+            #expect(!curl.isRunning, "curl is done: the listener answered and hung up after it")
+            #expect(burst.cpuSeconds < 0.15, "the burst used \(burst.cpuSeconds) s of CPU")
+
+            var ledger = NewbornLedger()
+            ledger.remember(contentsOf: newborns)
+            let born = try #require(ledger[curl.processIdentifier], "newborns: \(newborns.map { "\($0.pid) \($0.name)" })")
+            #expect(born.name == "curl")
+            #expect(born.executablePath?.hasSuffix("/curl") == true)
+            #expect(born.parentPID == getpid())
+            #expect(ledger.parent(of: curl.processIdentifier) == getpid())
+
+            // The kernel still lists curl's connection, with curl's pid, though curl is gone.
+            let table = TCPTable.read()
+            let rows = table.filter { $0.remotePort == listener.port }
+            let entry = try #require(rows.first { $0.lastPID == curl.processIdentifier }, "rows to the port: \(rows)")
+            Measurements.note("TCPTable: dead curl \(curl.processIdentifier) still on its connection: \(entry.state), so_last_pid \(entry.lastPID)")
+            #expect(entry.state == .timeWait)
+            #expect(entry.remoteIsLoopback)
+
+            // The pipeline's attribution: a runtime listening on the port, curl dead, this process alive above it.
+            let server = ScanAssemblyTests.process(2_000_000_000, parent: 1, "sd-server", "/Users/me/sd/sd-server", ["sd-server"],
+                                                   kind: Classification(.sdcpp), files: ScanAssemblyTests.sdFiles, ports: [listener.port])
+            let draft = RuntimeDraft(kind: .sdcpp, process: server, helpers: [], probePort: listener.port)
+            let result = ScanPipeline.tableClients(for: draft, table: table, processes: byPID, ledger: ledger, connections: [:], excluding: draft.pids)
+            let poller = try #require(result.pollers.first { $0.pid == curl.processIdentifier }, "pollers: \(result.pollers.map(\.pid))")
+            #expect(poller.name == "curl")
+            #expect(poller.port == listener.port)
+            #expect(poller.parentPID == getpid())
+            #expect(poller.chain.first?.pid == curl.processIdentifier)
+            #expect(poller.chain.first?.name == "curl")
+            #expect(poller.chain.dropFirst().first?.pid == getpid(), "chain: \(poller.chain.map(\.pid))")
+            #expect(result.evidence.dead >= 1)
+            #expect(result.evidence.inLedger >= 1)
+
+            let output = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: byPID,
+                                               cpuDeltas: [:], selfPID: 1, table: table, ledger: ledger)
+            let runtime = try #require(output.result.runtimes.first)
+            #expect(runtime.clients.contains { $0.pid == curl.processIdentifier })
+            #expect(runtime.attributionNote?.hasPrefix("caught 1 poller (") == true, Comment(rawValue: runtime.attributionNote ?? "nil"))
+            #expect(runtime.attributionNote?.contains("table: ") == true)
+            #expect(output.clientChains[curl.processIdentifier]?.dropFirst().first?.pid == getpid())
+        }
     }
 }

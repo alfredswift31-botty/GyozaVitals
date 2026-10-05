@@ -132,14 +132,6 @@ nonisolated enum ProcessFiles {
     /// The address union is 16 bytes: an in6_addr, or 12 bytes of padding
     /// followed by an in_addr (in4in6_addr). Both are in network byte order.
     private static func isLoopback<T>(_ address: T, ipv6: Bool) -> Bool {
-        withUnsafeBytes(of: address) { raw -> Bool in
-            guard raw.count >= 16 else { return false }
-            if ipv6 {
-                let isV6Loopback = raw[0..<15].allSatisfy { $0 == 0 } && raw[15] == 1
-                let isMappedV4Loopback = raw[0..<10].allSatisfy { $0 == 0 } && raw[10] == 0xff && raw[11] == 0xff && raw[12] == 127
-                return isV6Loopback || isMappedV4Loopback
-            }
-            return raw[12] == 127
-        }
+        withUnsafeBytes(of: address) { InetAddress.isLoopback($0, ipv6: ipv6) }
     }
 }

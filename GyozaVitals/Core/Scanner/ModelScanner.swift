@@ -115,11 +115,12 @@ actor ScanPipeline {
     private var cpuActivity = CPUActivity()
     /// What the APIs said last scan, by model id, for a scan where they don't answer.
     private var apiModels: [String: LoadedModel] = [:]
-    /// Last scan's busy verdict per runtime: the burst decision is made
-    /// before this scan's probes have answered.
-    private var lastBusy: [pid_t: Bool] = [:]
-    /// When each runtime was last watched for pollers.
-    private var lastBurst: [pid_t: Date] = [:]
+    /// When each runtime was last watched for newborns, and how many were born.
+    private var bursts: [pid_t: BurstRecord] = [:]
+    /// Processes born during the bursts of the last three minutes, so a
+    /// connection the TCP table attributes to a pid that has exited can be
+    /// walked up to its app.
+    private var ledger = NewbornLedger()
 
     /// Each probe gets this long (its GETs time out at `HTTPClient.defaultTimeout`
     /// and run concurrently); the file fallback answers for a slower one.
@@ -135,9 +136,10 @@ actor ScanPipeline {
     static let genericCandidateLimit = 40
     /// A process younger than this may still be loading its model.
     static let youngProcessSeconds: TimeInterval = 20
-    /// How long a runtime is watched for pollers, concurrently with the probes.
+    /// How long newborns are watched for, concurrently with the probes.
     static let burstDuration: TimeInterval = 1.2
-    /// A runtime is watched at most this often: a catch stays sticky for
+    /// A runtime is watched at most this often: the ledger keeps what a
+    /// burst saw for `NewbornLedger.memory`, and a catch stays sticky for
     /// `StickyClients.memory`, twice this.
     static let burstCooldown: TimeInterval = 30
 
@@ -164,27 +166,28 @@ actor ScanPipeline {
         let allPorts = Set(drafts.flatMap { $0.allListeningPorts })
         let connections = ClientFinder.connections(to: allPorts, among: processes)
 
-        // A busy runtime that no connection or launcher names is driven by
-        // something this scan can't see: watch for its pollers while the
-        // probes run. Last scan's verdict stands in for this scan's, which
-        // the probes haven't given yet; a quarter of a core now counts too.
+        // The kernel's TCP table keeps a closed connection, with the pid
+        // that made it, for 2 MSL after that process has exited: a helper
+        // that polled the runtime and died is still there. A connection to
+        // the runtime's ports from a pid that is neither alive nor in the
+        // ledger is the evidence that something short-lived polls it; a
+        // burst, while the probes run, catches the next one being born.
         let now = Date()
-        var burstPorts = Set<Int>()
+        ledger.forget(olderThan: now.addingTimeInterval(-NewbornLedger.memory))
+        var table = TCPTable.read()
+        var bursting: [pid_t] = []
         for draft in drafts {
             let pid = draft.process.pid
-            var scratch: [pid_t: [ProcessChainLink]] = [:]
-            let visible = Self.attribution(for: draft, connections: connections, processes: byPID, pollers: [],
-                                           excluding: draft.pids.union([selfPID]), chains: &scratch)
-            let busy = lastBusy[pid] == true || CPUActivity.busy(deltas: draft.pids.compactMap { cpuDeltas[$0] }) == true
-            guard Self.shouldBurst(ports: draft.allListeningPorts, hasClient: visible.hasClient, isBusy: busy,
-                                   lastBurst: lastBurst[pid], now: now) else { continue }
-            lastBurst[pid] = now
-            burstPorts.formUnion(draft.allListeningPorts)
+            let evidence = Self.tableClients(for: draft, table: table, processes: byPID, ledger: ledger, connections: connections,
+                                             excluding: draft.pids.union([selfPID])).evidence
+            guard Self.shouldBurst(ports: draft.allListeningPorts, unexplainedDead: evidence.unexplained, lastBurst: bursts[pid]?.at, now: now)
+            else { continue }
+            bursting.append(pid)
         }
         let catcher = pollerCatcher
         let known = Set(processes.map(\.pid))
-        let portsToWatch = burstPorts
-        async let burst = catcher.catchPollers(ports: portsToWatch, among: known, processes: byPID, duration: Self.burstDuration)
+        let watchFor = bursting.isEmpty ? 0 : Self.burstDuration
+        async let burst = catcher.watchNewborns(among: known, duration: watchFor)
 
         // Probe every draft at once, each within its deadline.
         let client = self.client
@@ -202,46 +205,120 @@ actor ScanPipeline {
             return results
         }
 
-        let pollers = Self.pollers(await burst, for: drafts)
+        let watched = await burst
+        if !bursting.isEmpty {
+            ledger.remember(contentsOf: watched.newborns)
+            for pid in bursting { bursts[pid] = BurstRecord(at: now, born: watched.newborns.count, cpuSeconds: watched.cpuSeconds) }
+            // The helpers born during the burst have hung up by now: their
+            // connections are in the table, with pids the ledger knows.
+            table = TCPTable.read()
+        }
         let output = Self.assemble(drafts: drafts, results: results, manifests: manifests, connections: connections,
-                                   processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID, pollers: pollers,
+                                   processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID, table: table, ledger: ledger, bursts: bursts,
                                    gpuUtilization: gpuUtilization, previous: apiModels, now: Date())
         apiModels = output.apiModels
         let live = Set(output.result.runtimes.map(\.pid))
-        lastBusy = Dictionary(output.result.runtimes.map { ($0.pid, $0.isBusy ?? false) }, uniquingKeysWith: { first, _ in first })
-        lastBurst = lastBurst.filter { live.contains($0.key) }
+        bursts = bursts.filter { live.contains($0.key) }
         return output
     }
 
-    /// Whether to spend a burst on a runtime: it listens somewhere (a), no
-    /// connection or launcher names a client (b), it is busy (c): polls
-    /// happen during a generation, and it hasn't been watched within
-    /// `burstCooldown` (d): the main actor keeps a catch sticky for a minute.
-    static func shouldBurst(ports: Set<Int>, hasClient: Bool, isBusy: Bool, lastBurst: Date?, now: Date) -> Bool {
-        guard !ports.isEmpty, !hasClient, isBusy else { return false }
+    /// Whether to spend a burst on a runtime: it listens somewhere (a), the
+    /// TCP table shows a connection to its ports from a pid that is neither
+    /// alive nor in the ledger (b): something short-lived polls it and the
+    /// next one can be caught being born, and it hasn't been watched within
+    /// `burstCooldown` (c): the ledger keeps what a burst saw for three
+    /// minutes, and the main actor keeps a client for one.
+    static func shouldBurst(ports: Set<Int>, unexplainedDead: Int, lastBurst: Date?, now: Date) -> Bool {
+        guard !ports.isEmpty, unexplainedDead > 0 else { return false }
         if let lastBurst, now.timeIntervalSince(lastBurst) < burstCooldown { return false }
         return true
     }
 
-    /// Caught pollers by the pid of the runtime whose port they connected to.
-    static func pollers(_ caught: [CaughtPoller], for drafts: [RuntimeDraft]) -> [pid_t: [CaughtPoller]] {
-        var result: [pid_t: [CaughtPoller]] = [:]
-        for poller in caught {
-            for draft in drafts where draft.allListeningPorts.contains(poller.port) {
-                result[draft.process.pid, default: []].append(poller)
+    /// What the TCP table says about one runtime's ports, for the
+    /// diagnostics note and the burst decision.
+    nonisolated struct TableEvidence: Hashable, Sendable {
+        /// The runtime's ports that have clients in the table.
+        var ports: Set<Int> = []
+        /// Connections to those ports (loopback, any state but listening),
+        /// other than the runtime's own and this app's.
+        var connections = 0
+        /// ...whose pid is not in the process snapshot: the client has exited.
+        var dead = 0
+        /// ...dead, and born during a burst, so the ledger knows its parent.
+        var inLedger = 0
+
+        /// Dead clients nobody can explain: the reason to burst.
+        var unexplained: Int { dead - inLedger }
+
+        /// "table: 11 to :1235, 9 dead, 3 in ledger"; nil with no connection.
+        var note: String? {
+            guard connections > 0 else { return nil }
+            let to = ports.sorted().map { ":\($0)" }.joined(separator: "/")
+            return "table: \(connections) to \(to), \(dead) dead, \(inLedger) in ledger"
+        }
+    }
+
+    /// The TCP table's clients of one runtime as pollers, each pid once,
+    /// with the evidence counts. A live pid is chained through the snapshot
+    /// (unless a connection open now already counts it); a dead one through
+    /// the ledger, up to its first live ancestor; a dead pid the ledger
+    /// never saw is counted and left for the burst.
+    static func tableClients(for draft: RuntimeDraft, table: [TCPTableEntry], processes byPID: [pid_t: ProcessRecord], ledger: NewbornLedger,
+                             connections: [Int: [ProcessRecord]], excluding: Set<pid_t>) -> (pollers: [CaughtPoller], evidence: TableEvidence) {
+        var evidence = TableEvidence()
+        var pollers: [pid_t: CaughtPoller] = [:]
+        for entry in TCPTable.clients(of: draft.allListeningPorts, in: table) {
+            let pid = entry.lastPID
+            guard pid > 0, !excluding.contains(pid) else { continue }
+            evidence.connections += 1
+            evidence.ports.insert(entry.remotePort)
+            if let live = byPID[pid] {
+                let connected = connections[entry.remotePort]?.contains { $0.pid == pid } ?? false
+                guard !connected, pollers[pid] == nil else { continue }
+                pollers[pid] = CaughtPoller(pid: pid, name: ClientFinder.displayName(for: live), executablePath: live.executablePath,
+                                            parentPID: live.parentPID, port: entry.remotePort, chain: ClientFinder.chain(from: live, among: byPID))
+            } else {
+                evidence.dead += 1
+                guard let newborn = ledger[pid] else { continue }
+                evidence.inLedger += 1
+                guard pollers[pid] == nil else { continue }
+                pollers[pid] = CaughtPoller(pid: pid, name: newborn.displayName, executablePath: newborn.executablePath,
+                                            parentPID: newborn.parentPID, port: entry.remotePort,
+                                            chain: chain(fromDead: pid, ledger: ledger, among: byPID))
             }
         }
-        return result
+        return (pollers.values.sorted { $0.pid < $1.pid }, evidence)
+    }
+
+    /// The chain of a process that has exited: its own link from the ledger,
+    /// then up through the ledger until a live ancestor, whose chain the
+    /// snapshot gives. A wrapper shell on the way (`sh -c curl`, itself a
+    /// newborn that lived milliseconds) is left out: it is not a terminal's
+    /// shell, which would end the walk, and the app above it is the client.
+    static func chain(fromDead pid: pid_t, ledger: NewbornLedger, among byPID: [pid_t: ProcessRecord]) -> [ProcessChainLink] {
+        var links: [ProcessChainLink] = []
+        var seen = Set<pid_t>()
+        var current = pid
+        while current > 1, links.count < ClientFinder.chainLimit, seen.insert(current).inserted {
+            if let live = byPID[current] { return links + ClientFinder.chain(from: live, among: byPID) }
+            guard let newborn = ledger[current] else { break }
+            let link = ProcessChainLink(pid: current, name: newborn.displayName, executablePath: newborn.executablePath)
+            if links.isEmpty || !ClientFinder.isBoundary(link) { links.append(link) }
+            current = newborn.parentPID
+        }
+        return links
     }
 
     /// Runtimes and models from what was found, pure: drafts, what their
     /// probes said, who connects to their ports, how much CPU they used
-    /// since the last scan, the pollers caught per runtime pid, the system
-    /// GPU, and what the APIs said last time (`previous`, by model id) for a
-    /// probe that didn't answer now.
+    /// since the last scan, pollers already caught per runtime pid, the TCP
+    /// table with the ledger that explains its dead pids and the last burst
+    /// per runtime, the system GPU, and what the APIs said last time
+    /// (`previous`, by model id) for a probe that didn't answer now.
     static func assemble(drafts: [RuntimeDraft], results: [pid_t: ProbeResult], manifests: [String: String],
                          connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
                          cpuDeltas: [pid_t: CPUActivity.Delta], selfPID: pid_t, pollers: [pid_t: [CaughtPoller]] = [:],
+                         table: [TCPTableEntry] = [], ledger: NewbornLedger = NewbornLedger(), bursts: [pid_t: BurstRecord] = [:],
                          gpuUtilization: Double? = nil, previous: [String: LoadedModel] = [:], now: Date = Date()) -> PipelineOutput {
         var runtimes: [RuntimeInstance] = []
         var models: [LoadedModel] = []
@@ -274,8 +351,12 @@ actor ScanPipeline {
         for draft in drafts {
             let pid = draft.process.pid
             let probe = probes[pid] ?? .nothing
-            let attribution = Self.attribution(for: draft, connections: connections, processes: byPID, pollers: pollers[pid] ?? [],
-                                               excluding: draft.pids.union([selfPID]), chains: &chains)
+            let excluding = draft.pids.union([selfPID])
+            let fromTable = Self.tableClients(for: draft, table: table, processes: byPID, ledger: ledger, connections: connections,
+                                              excluding: excluding)
+            let attribution = Self.attribution(for: draft, connections: connections, processes: byPID,
+                                               pollers: (pollers[pid] ?? []) + fromTable.pollers, evidence: fromTable.evidence,
+                                               burst: bursts[pid], excluding: excluding, chains: &chains)
             let clients = attribution.clients
             let share = shares[pid] ?? nil
             let candidate = candidates[pid] != nil
@@ -485,18 +566,37 @@ actor ScanPipeline {
         var connected = 0
         /// The process that launched the runtime counts.
         var launcher = false
-        /// Short-lived processes the burst caught connecting.
-        var caught = 0
+        /// The distinct parents of the pollers caught (nine helpers of one
+        /// app are one poller), and the app or process each resolves to.
+        var caughtParents: Set<pid_t> = []
+        var caughtNames: [String] = []
+        /// What the TCP table showed for the runtime's ports.
+        var evidence = TableEvidence()
+        /// The last burst spent on the runtime, if any.
+        var burst: BurstRecord?
 
         var hasClient: Bool { !clients.isEmpty }
+        var caught: Int { caughtParents.count }
 
-        /// "2 connected, launcher, caught 1 poller", or "no client seen".
+        /// "2 connected, launcher, caught 1 poller (Qwen Image)", or "no
+        /// client seen"; then, when there is anything to add, what the table
+        /// and the last burst showed: " · table: 11 to :1235, 9 dead, 3 in
+        /// ledger · burst 16:16:40, 7 born, 23 ms".
         var note: String {
             var parts: [String] = []
             if connected > 0 { parts.append("\(connected) connected") }
             if launcher { parts.append("launcher") }
-            if caught > 0 { parts.append("caught \(caught) \(caught == 1 ? "poller" : "pollers")") }
-            return parts.isEmpty ? "no client seen" : parts.joined(separator: ", ")
+            if caught > 0 {
+                var part = "caught \(caught) \(caught == 1 ? "poller" : "pollers")"
+                if !caughtNames.isEmpty { part += " (\(caughtNames.joined(separator: ", ")))" }
+                parts.append(part)
+            }
+            var line = parts.isEmpty ? "no client seen" : parts.joined(separator: ", ")
+            if let table = evidence.note { line += " · \(table)" }
+            if let burst {
+                line += " · burst \(Formatting.clockWithSeconds(burst.at)), \(burst.born) born, \(Int((burst.cpuSeconds * 1000).rounded())) ms"
+            }
+            return line
         }
     }
 
@@ -505,9 +605,10 @@ actor ScanPipeline {
     /// process whose chain passes through the runtime itself is its child,
     /// not a client (Ollama talking to its runner, a server's own worker).
     /// Three sources: connections open now, the runtime's launcher, and the
-    /// pollers a burst caught (see `PollerCatcher`), each once per pid.
+    /// pollers the TCP table shows (see `tableClients`), each once per pid.
     static func attribution(for draft: RuntimeDraft, connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
-                            pollers: [CaughtPoller], excluding: Set<pid_t>, chains: inout [pid_t: [ProcessChainLink]]) -> Attribution {
+                            pollers: [CaughtPoller], evidence: TableEvidence = TableEvidence(), burst: BurstRecord? = nil,
+                            excluding: Set<pid_t>, chains: inout [pid_t: [ProcessChainLink]]) -> Attribution {
         var seen = Set<pid_t>()
         var clients: [ClientApp] = []
         var attribution = Attribution()
@@ -534,16 +635,25 @@ actor ScanPipeline {
                 attribution.launcher = true
             }
         }
-        // A poller caught mid-request is a connecting process that happened
-        // to live for milliseconds: same chain rules, same resolution.
+        // A poller is a connecting process that happened to live for
+        // milliseconds: same chain rules, same resolution. Its parent is
+        // what counts (nine helpers of one app are one poller), named by
+        // the app the chain resolves to, else by the process itself.
         for poller in pollers where !excluding.contains(poller.pid) && seen.insert(poller.pid).inserted {
             let chain = poller.chain.isEmpty
                 ? [ProcessChainLink(pid: poller.pid, name: poller.name, executablePath: poller.executablePath)] : poller.chain
             guard !ClientFinder.chain(chain, passesThrough: excluding) else { continue }
             chains[poller.pid] = chain
             clients.append(ClientApp(pid: poller.pid, name: poller.name, bundleIdentifier: nil))
-            attribution.caught += 1
+            let resolved = ClientFinder.resolveApp(chain: chain)
+            let parent = resolved?.app.pid ?? chain.dropFirst().first?.pid ?? poller.parentPID
+            if attribution.caughtParents.insert(parent).inserted {
+                let name = resolved?.app.name ?? poller.name
+                if !attribution.caughtNames.contains(name) { attribution.caughtNames.append(name) }
+            }
         }
+        attribution.evidence = evidence
+        attribution.burst = burst
         attribution.clients = clients.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         return attribution
     }
