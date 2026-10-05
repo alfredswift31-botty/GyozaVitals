@@ -1754,7 +1754,7 @@ struct RealMachineTests {
 struct ProbeJSONTests {
     @Test func aHugeOrOddNumberNeverTraps() {
         #expect(JSON.uint64(NSNumber(value: 1e30)) == UInt64.max)
-        #expect(JSON.uint64(NSNumber(value: Double.infinity)) == UInt64.max)
+        #expect(JSON.uint64(NSNumber(value: Double.infinity)) == 0, "not finite is garbage, not a size")
         #expect(JSON.uint64(NSNumber(value: Double.nan)) == 0)
         #expect(JSON.uint64(NSNumber(value: -5)) == 0)
         #expect(JSON.uint64(NSNumber(value: 6_550_000_000)) == 6_550_000_000)

@@ -91,6 +91,8 @@ nonisolated enum JSON {
     }
 
     static func clampedUInt64(_ double: Double) -> UInt64 {
+        // nan and infinity are garbage, not sizes: 0. A finite number past the
+        // maximum is a size too big to hold: the maximum.
         guard double.isFinite, double > 0 else { return 0 }
         return double >= 18_446_744_073_709_551_615.0 ? UInt64.max : UInt64(double)
     }
