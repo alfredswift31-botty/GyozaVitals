@@ -15,6 +15,7 @@ Read-only. It never loads, unloads or interrupts anything.
 Without root or private frameworks there is no CPU frequency, no Neural Engine utilisation, no per-component watts, and no view into Apple Intelligence's own model (its daemons run as root). GyozaVitals says "not observable" rather than guessing.
 
 ## Versions
+- **1.0.7** (5 Oct 2026): "used by" catches apps that talk to their runtime through short-lived helper processes, by watching for newborn processes that connect to the runtime's port during a brief burst.
 - **1.0.6** (5 Oct 2026): the app that launched a runtime counts as its user, so "used by" no longer depends on catching a connection at the scan instant.
 - **1.0.5** (5 Oct 2026): "used by" keeps an app for a minute after its last connection, so apps that poll their runtime stay attributed between polls.
 - **1.0.4** (2 Oct 2026): the red dot works on Metal-bound generation; the CPU floor behind it was set from a real measurement.
