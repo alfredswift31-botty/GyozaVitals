@@ -95,3 +95,36 @@ final class SequenceMetrics: SystemMetricsSource {
         snapshots.count > 1 ? snapshots.removeFirst() : snapshots[0]
     }
 }
+
+struct StickyClientsTests {
+    private let app = ClientApp(pid: 501, name: "Qwen Image", bundleIdentifier: "com.gyoza.QwenImage")
+
+    @Test func clientsSurviveAMinuteOfEmptyScans() {
+        var sticky = StickyClients()
+        let t0 = Date()
+        #expect(sticky.update(pid: 10, seen: [app], now: t0) == [app])
+        // Between polls: nothing seen, the app is still shown.
+        #expect(sticky.update(pid: 10, seen: [], now: t0.addingTimeInterval(5)) == [app])
+        #expect(sticky.update(pid: 10, seen: [], now: t0.addingTimeInterval(59)) == [app])
+        // A minute without a sighting: gone.
+        #expect(sticky.update(pid: 10, seen: [], now: t0.addingTimeInterval(61)).isEmpty)
+        // And it stays gone until seen again.
+        #expect(sticky.update(pid: 10, seen: [], now: t0.addingTimeInterval(62)).isEmpty)
+    }
+
+    @Test func aSightingRefreshesTheClock() {
+        var sticky = StickyClients()
+        let t0 = Date()
+        _ = sticky.update(pid: 10, seen: [app], now: t0)
+        _ = sticky.update(pid: 10, seen: [app], now: t0.addingTimeInterval(50))
+        #expect(sticky.update(pid: 10, seen: [], now: t0.addingTimeInterval(100)) == [app])
+    }
+
+    @Test func aDeadRuntimeIsForgotten() {
+        var sticky = StickyClients()
+        let t0 = Date()
+        _ = sticky.update(pid: 10, seen: [app], now: t0)
+        sticky.forget(except: [])
+        #expect(sticky.update(pid: 10, seen: [], now: t0.addingTimeInterval(1)).isEmpty)
+    }
+}

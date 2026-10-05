@@ -11,6 +11,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | 1.0.2 | 2026-10-02 | [v1.0.2](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.2) |
 | 1.0.3 | 2026-10-02 | [v1.0.3](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.3) |
 | 1.0.4 | 2026-10-02 | [v1.0.4](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.4) |
+| 1.0.5 | 2026-10-05 | [v1.0.5](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.5) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -99,6 +100,9 @@ First screenshot of the pane, mid-generation: `sd.cpp · api: no api · cpu 0.00
 **Verified by the user on 1.0.4:** mid-generation, all four sd.cpp rows carry the red dot, whisper none, GPU 100 %. The red dot has now been seen working on a real Metal workload.
 
 Also confirmed by the 1.0.2 prompt-helper screenshot: one Ollama row, a live unload countdown, no "loading", "used by Qwen Image".
+
+## 1.0.5: clients between polls (5 Oct 2026)
+A health check from the user three days on: red dots on all sd.cpp rows with `cpu 0.022 · gpu 1.00 · decided by gpu`, whisper and the idle Ollama correctly not candidates, memory summing to 16 GB, pressure warnings logged with times. One gap: the sd.cpp rows read `sd.cpp · gpu` with no `· Qwen Image`, where earlier scans had shown the app. Attribution was point-in-time: only connections open at the scan instant. An app that drives its runtime with short polling requests is usually between polls when a scan lands. `StickyClients` now keeps a runtime's last non-empty client list for 60 s after the last sighting, and forgets runtimes that are gone so a reused pid can't inherit clients. Trade-off, deliberate: an app that quits can linger on a row for up to a minute.
 
 ## Where things stand (end of 2 Oct 2026)
 **Origin.** GyozaVitals was #4 on a list of twelve project ideas built from the models already on the user's Mac (see `docs/PROJECT-IDEAS.md` in the GyozaIsland repo). It was picked first because it is small and because every other local-model project on the list would hit the same RAM collisions it makes visible.

@@ -12,6 +12,7 @@ import FoundationModels
 final class ModelScanner: ModelScanSource {
     private let pipeline = ScanPipeline()
     private var firstSeen: [String: Date] = [:]
+    private var stickyClients = StickyClients()
     /// The system GPU utilisation the store last measured (0...1), for the
     /// busy heuristic of runtimes with no API. Nil: unknown, CPU rule only.
     var gpuUtilization: Double?
@@ -31,10 +32,11 @@ final class ModelScanner: ModelScanSource {
         var byRuntime: [pid_t: [ClientApp]] = [:]
         result.runtimes = result.runtimes.map { runtime in
             var runtime = runtime
-            runtime.clients = resolver.resolve(runtime.clients)
+            runtime.clients = stickyClients.update(pid: runtime.pid, seen: resolver.resolve(runtime.clients), now: now)
             byRuntime[runtime.pid] = runtime.clients
             return runtime
         }
+        stickyClients.forget(except: Set(result.runtimes.map(\.pid)))
         result.models = result.models.map { model in
             var model = model
             let date = firstSeen[model.id] ?? now
@@ -447,5 +449,36 @@ actor ScanPipeline {
             manifestsBuiltAt = Date()
         }
         return manifestNames
+    }
+}
+
+/// Clients a runtime was seen with recently. A scan only sees connections
+/// open at that instant; an app that drives its runtime with short polling
+/// requests (start the job, then ask for progress every second) is usually
+/// between polls when the scan lands. The owner's Qwen Image app showed as
+/// the client on some scans and vanished on others for exactly that reason.
+/// So a runtime keeps its last non-empty client list for `memory` seconds.
+nonisolated struct StickyClients {
+    static let memory: TimeInterval = 60
+
+    private var last: [pid_t: (clients: [ClientApp], seen: Date)] = [:]
+
+    /// The clients to show for this runtime: what was seen now, or what was
+    /// seen within the last minute.
+    mutating func update(pid: pid_t, seen: [ClientApp], now: Date) -> [ClientApp] {
+        if !seen.isEmpty {
+            last[pid] = (seen, now)
+            return seen
+        }
+        if let remembered = last[pid], now.timeIntervalSince(remembered.seen) <= Self.memory {
+            return remembered.clients
+        }
+        last[pid] = nil
+        return []
+    }
+
+    /// Drop runtimes that are gone, so a reused pid can't inherit clients.
+    mutating func forget(except live: Set<pid_t>) {
+        last = last.filter { live.contains($0.key) }
     }
 }
