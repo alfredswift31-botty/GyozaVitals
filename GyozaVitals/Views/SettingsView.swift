@@ -102,7 +102,8 @@ struct SettingsView: View {
             candidate,
             "decided by \(d?.decidedBy ?? dash)",
             "clients: \(runtime.attributionNote ?? dash)",
-        ].joined(separator: " · ")
+            runtime.version.map { "v\($0)" },
+        ].compactMap { $0 }.joined(separator: " · ")
     }
 
     /// "last scan 14:02:37 · 5 models".

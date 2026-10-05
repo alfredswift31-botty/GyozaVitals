@@ -23,6 +23,13 @@ final class ModelScanner: ModelScanSource {
         gpuUtilization = utilization
     }
 
+    /// Whether a resolved client is the runtime's own app, by exact name
+    /// (case-insensitive): "Ollama" is, "Ollamac" and "Ollama Grid Search"
+    /// are third-party clients and stay.
+    nonisolated static func isOwnApp(_ client: ClientApp, of kind: RuntimeKind) -> Bool {
+        client.name.caseInsensitiveCompare(kind.displayName) == .orderedSame
+    }
+
     func scan(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult {
         let output = await pipeline.run(watched: watched, ports: ports, gpuUtilization: gpuUtilization)
         var result = output.result
@@ -33,8 +40,7 @@ final class ModelScanner: ModelScanSource {
         result.runtimes = result.runtimes.map { runtime in
             var runtime = runtime
             // A runtime's own app isn't its client: Ollama.app launches `ollama serve`.
-            let own = runtime.kind.displayName.lowercased()
-            let seen = resolver.resolve(runtime.clients).filter { !$0.name.lowercased().contains(own) }
+            let seen = resolver.resolve(runtime.clients).filter { !Self.isOwnApp($0, of: runtime.kind) }
             runtime.clients = stickyClients.update(pid: runtime.pid, seen: seen, now: now)
             byRuntime[runtime.pid] = runtime.clients
             return runtime
@@ -96,7 +102,7 @@ struct ClientResolver {
 
     /// The app's own name and bundle id when the pid is an app; the kernel's
     /// executable name otherwise.
-    static func named(_ link: ProcessChainLink) -> ProcessChainLink {
+    nonisolated static func named(_ link: ProcessChainLink) -> ProcessChainLink {
         guard let app = NSRunningApplication(processIdentifier: link.pid) else { return link }
         var link = link
         if let name = app.localizedName, !name.isEmpty { link.name = name }

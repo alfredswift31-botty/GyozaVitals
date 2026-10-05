@@ -85,7 +85,8 @@ jobs:
             -target GyozaVitals \
             -configuration Release \
             SYMROOT="$PWD/build" \
-            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
 
       # Facts the app depends on at runtime that no unit test can see.
       - name: Verify the built app
@@ -96,6 +97,8 @@ jobs:
           echo "== Not sandboxed: reading other processes needs libproc =="
           codesign -d --entitlements - --xml "$APP" > entitlements.plist || true
           if grep -q "com.apple.security.app-sandbox" entitlements.plist; then echo "App must not be sandboxed"; exit 1; fi
+          echo "== No debug entitlement: get-task-allow would let any local process attach =="
+          if grep -q "get-task-allow" entitlements.plist; then echo "Release app carries get-task-allow"; exit 1; fi
           echo "== App icon =="
           test -f "$APP/Contents/Resources/AppIcon.icns" || test -f "$APP/Contents/Resources/Assets.car" \
             || { echo "No compiled app icon"; exit 1; }

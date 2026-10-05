@@ -20,6 +20,9 @@ struct FormattingTests {
         #expect(Formatting.countdown(to: now.addingTimeInterval(252), from: now) == "4:12")
         #expect(Formatting.countdown(to: now.addingTimeInterval(3_725), from: now) == "1:02:05")
         #expect(Formatting.countdown(to: now.addingTimeInterval(-5), from: now) == "now")
+        // Ollama's keep_alive -1 puts expires_at decades away: not a timer.
+        #expect(Formatting.countdown(to: now.addingTimeInterval(Formatting.countdownLimit), from: now) == "kept")
+        #expect(Formatting.countdown(to: now.addingTimeInterval(80_000_000_000), from: now) == "kept")
     }
 }
 
@@ -49,12 +52,19 @@ struct VitalsStoreTests {
 
     @Test func diffRecordsLoadsEvictionsAndUnloads() async {
         let settings = Fixtures.settings()
+        // The fixtures' clock is in the past; give hermes3 a keep-alive that
+        // has not run out, so losing it is an eviction.
+        let models = Fixtures.models.map { model in
+            var model = model
+            if model.expiresAt != nil { model.expiresAt = Date().addingTimeInterval(600) }
+            return model
+        }
         let scanner = SequenceScanner(results: [
             .empty,
-            ScanResult(runtimes: Fixtures.runtimes, models: Fixtures.models, appleIntelligenceAvailable: nil),
-            // Ollama still up but hermes3 gone: evicted. whisper gone with its process: unloaded.
+            ScanResult(runtimes: Fixtures.runtimes, models: models, appleIntelligenceAvailable: nil),
+            // Ollama still up but hermes3 gone before its time: evicted. whisper gone with its process: unloaded.
             ScanResult(runtimes: Fixtures.runtimes.filter { $0.kind != .whisper },
-                       models: Fixtures.models.filter { $0.name != "hermes3:8b" && $0.runtime != .whisper },
+                       models: models.filter { $0.name != "hermes3:8b" && $0.runtime != .whisper },
                        appleIntelligenceAvailable: nil),
         ])
         let store = VitalsStore(settings: settings, metrics: StaticMetrics(snapshot: Fixtures.system), scanner: scanner)
@@ -67,6 +77,36 @@ struct VitalsStoreTests {
         #expect(store.events.contains { $0.kind == .unloaded && $0.text.contains("ggml-large-v3-turbo") })
         #expect(store.events.contains { $0.kind == .runtimeStopped && $0.text.contains("whisper") })
         #expect(store.events.first!.date >= store.events.last!.date)
+    }
+
+    @Test func aKeepAliveThatEndsOnTimeIsUnloadedNotEvicted() async {
+        var models = Fixtures.models
+        // hermes3's keep-alive ran out ten seconds ago; Ollama is still up.
+        for index in models.indices where models[index].name == "hermes3:8b" {
+            models[index].expiresAt = Date().addingTimeInterval(-10)
+        }
+        let scanner = SequenceScanner(results: [
+            ScanResult(runtimes: Fixtures.runtimes, models: models, appleIntelligenceAvailable: nil),
+            ScanResult(runtimes: Fixtures.runtimes, models: models.filter { $0.name != "hermes3:8b" }, appleIntelligenceAvailable: nil),
+        ])
+        let store = VitalsStore(settings: Fixtures.settings(), metrics: StaticMetrics(snapshot: Fixtures.system), scanner: scanner)
+        await store.refreshScan()
+        await store.refreshScan()
+        let event = store.events.first { $0.text.contains("hermes3:8b") }
+        #expect(event?.kind == .unloaded)
+        #expect(event?.text.contains("keep-alive") == true)
+        #expect(!store.events.contains { $0.kind == .evicted })
+    }
+
+    @Test func aScanInFlightIsNotOverlapped() async {
+        let scanner = SlowScanner()
+        let store = VitalsStore(settings: Fixtures.settings(), metrics: StaticMetrics(snapshot: Fixtures.system), scanner: scanner)
+        async let first: Void = store.refreshScan()
+        async let second: Void = store.refreshScan()
+        _ = await (first, second)
+        #expect(scanner.scans == 1)
+        await store.refreshScan()
+        #expect(scanner.scans == 2)
     }
 
     @Test func pressureTransitionsAreLogged() async {
@@ -85,6 +125,16 @@ final class SequenceScanner: ModelScanSource {
     init(results: [ScanResult]) { self.results = results }
     func scan(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult {
         results.count > 1 ? results.removeFirst() : results[0]
+    }
+}
+
+/// A scan that takes a while and counts how often it was asked.
+final class SlowScanner: ModelScanSource {
+    private(set) var scans = 0
+    func scan(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int]) async -> ScanResult {
+        scans += 1
+        try? await Task.sleep(for: .milliseconds(150))
+        return .empty
     }
 }
 

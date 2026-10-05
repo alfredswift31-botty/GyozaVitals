@@ -163,22 +163,9 @@ extension View {
             .foregroundStyle(Theme.inkTertiary)
     }
 
-    /// Large lowercase display type.
-    func displayStyle() -> some View {
-        self.font(Theme.Typeface.display)
-            .tracking(Theme.Typeface.displayTracking)
-            .foregroundStyle(Theme.ink)
-    }
-
     func titleStyle() -> some View {
         self.font(Theme.Typeface.title)
             .tracking(Theme.Typeface.titleTracking)
-            .foregroundStyle(Theme.ink)
-    }
-
-    func bodyStyle() -> some View {
-        self.font(Theme.Typeface.body)
-            .lineSpacing(Theme.Typeface.bodyLineSpacing)
             .foregroundStyle(Theme.ink)
     }
 }
@@ -235,122 +222,44 @@ struct SectionLabel: View {
 }
 
 /// A keyboard shortcut drawn as a key.
-struct KeyCap: View {
-    let keys: String
-
-    init(_ keys: String) {
-        self.keys = keys
-    }
-
-    var body: some View {
-        Text(keys)
-            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-            .foregroundStyle(Theme.inkSecondary)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1.5)
-            .overlay(RoundedRectangle(cornerRadius: 3.5).strokeBorder(Theme.hairline))
-            .accessibilityLabel("Shortcut \(keys)")
-    }
-}
-
-/// A small red dot that breathes while recording; still when Reduce Motion is on.
+/// A small red dot that breathes while live and on screen; still when Reduce
+/// Motion is on or when `animates` is false. A repeating animation keeps
+/// SwiftUI rendering every frame even in a menu-bar window that has been
+/// closed, so the owner turns it off with the window.
 struct LiveDot: View {
     var isLive = true
+    var animates = true
     var size: CGFloat = 9
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var dim = false
+
+    private var breathing: Bool { isLive && animates && !reduceMotion }
 
     var body: some View {
         Circle()
             .fill(isLive ? Theme.live : Theme.inkTertiary)
             .frame(width: size, height: size)
-            .opacity(isLive && dim && !reduceMotion ? 0.35 : 1)
-            .onAppear {
-                guard isLive, !reduceMotion else { return }
-                withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) { dim = true }
-            }
+            .opacity(breathing && dim ? 0.35 : 1)
+            .onAppear { update() }
+            .onDisappear { stop() }
+            .onChange(of: breathing) { update() }
             .accessibilityLabel(isLive ? "Recording" : "Not recording")
     }
-}
 
-/// An empty or waiting screen: one large lowercase word, one line of plain
-/// text, at most one action. Left-aligned on the page grid, like the poster.
-struct EmptyState<Action: View>: View {
-    let word: String
-    let message: String
-    @ViewBuilder var action: () -> Action
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.l) {
-            Text(word).displayStyle()
-            Text(message)
-                .font(Theme.Typeface.body)
-                .lineSpacing(Theme.Typeface.bodyLineSpacing)
-                .foregroundStyle(Theme.inkSecondary)
-                .frame(maxWidth: 360, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-            action()
-                .padding(.top, Theme.Space.s)
+    private func update() {
+        if breathing {
+            withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) { dim = true }
+        } else {
+            stop()
         }
-        .padding(Theme.Space.page)
-        // A floor on the width: measured very narrow, the wrapping message asks
-        // for more height than the window has and a split view lays out off screen.
-        .frame(minWidth: 360 + 2 * Theme.Space.page, maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
     }
-}
 
-extension EmptyState where Action == EmptyView {
-    init(word: String, message: String) {
-        self.init(word: word, message: message) { EmptyView() }
+    /// Replaces the repeating animation with none, which ends it.
+    private func stop() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { dim = false }
     }
-}
-
-// MARK: - Buttons
-
-/// The one filled button on a screen: ink fill, inverse text, crisp corners.
-struct PrimaryButtonStyle: ButtonStyle {
-    var tint: Color = Theme.ink
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(Theme.inkInverse)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-            .background(tint.opacity(configuration.isPressed ? 0.82 : 1), in: RoundedRectangle(cornerRadius: Theme.Radius.control))
-            .scaleEffect(configuration.isPressed ? Theme.Motion.pressedScale : 1)
-            .opacity(isEnabled ? 1 : 0.35)
-            .animation(Theme.Motion.quick, value: configuration.isPressed)
-    }
-}
-
-/// Everything else: text on a hairline outline, washed when pressed.
-struct QuietButtonStyle: ButtonStyle {
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(Theme.ink)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(configuration.isPressed ? Theme.wash : Color.clear, in: RoundedRectangle(cornerRadius: Theme.Radius.control))
-            .overlay(RoundedRectangle(cornerRadius: Theme.Radius.control).strokeBorder(Theme.hairline))
-            .scaleEffect(configuration.isPressed ? Theme.Motion.pressedScale : 1)
-            .opacity(isEnabled ? 1 : 0.35)
-            .animation(Theme.Motion.quick, value: configuration.isPressed)
-    }
-}
-
-extension ButtonStyle where Self == PrimaryButtonStyle {
-    static var primary: PrimaryButtonStyle { PrimaryButtonStyle() }
-    /// The destructive or "stop recording" button.
-    static var live: PrimaryButtonStyle { PrimaryButtonStyle(tint: Theme.live) }
-}
-
-extension ButtonStyle where Self == QuietButtonStyle {
-    static var quiet: QuietButtonStyle { QuietButtonStyle() }
 }
 
 // MARK: - Fields

@@ -82,13 +82,17 @@ nonisolated enum JSON {
         return nil
     }
 
+    /// A byte count or similar: clamped to 0...UInt64.max, since a runtime
+    /// API is any local process and `UInt64(Double)` traps out of range.
     static func uint64(_ value: Any?) -> UInt64? {
-        if let number = value as? NSNumber {
-            let double = number.doubleValue
-            return double > 0 ? UInt64(double) : 0
-        }
-        if let string = value as? String { return UInt64(string) }
+        if let number = value as? NSNumber { return clampedUInt64(number.doubleValue) }
+        if let string = value as? String { return UInt64(string) ?? Double(string).map(clampedUInt64) }
         return nil
+    }
+
+    static func clampedUInt64(_ double: Double) -> UInt64 {
+        guard double.isFinite, double > 0 else { return 0 }
+        return double >= 18_446_744_073_709_551_615.0 ? UInt64.max : UInt64(double)
     }
 
     static func bool(_ value: Any?) -> Bool? {

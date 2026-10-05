@@ -19,7 +19,7 @@ struct VitalsPopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: Theme.Space.l) {
-                ModelsSection(models: store.models, appleIntelligenceAvailable: store.appleIntelligenceAvailable)
+                ModelsSection(models: store.models, appleIntelligenceAvailable: store.appleIntelligenceAvailable, isOnScreen: store.isPopoverOpen)
                 MemorySection(memory: store.system?.memory, modelBytes: store.modelBytes, history: pressureHistory)
                 ProcessorSection(cpu: store.system?.cpu, gpu: store.system?.gpu, thermal: store.system?.thermal)
                 PowerSection(power: store.system?.power)

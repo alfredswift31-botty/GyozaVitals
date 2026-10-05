@@ -15,6 +15,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | 1.0.6 | 2026-10-05 | [v1.0.6](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.6) |
 | 1.0.7 | 2026-10-05 | [v1.0.7](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.7) |
 | 1.0.8 | 2026-10-05 | [v1.0.8](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.8) |
+| 1.0.9 | 2026-10-05 | [v1.0.9](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.9) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -131,6 +132,18 @@ The end-to-end test spawns `curl` against a listener in the test process that an
 
 
 One more measurement from CI, on the first develop run: a 5 ms tick can see a spawned child before its exec has completed, so the ledger recorded `curl` under the test process's own name and path. Attribution did not care (it walks pids), but the diagnostics name would have been the parent's. A newborn is now re-read on the following ticks for 50 ms and the later image wins.
+
+## 1.0.9: fixes from an independent audit (5 Oct 2026)
+A second session audited 1.0.8 on the user's Mac: read every file, ran the suite there, profiled the running app for 45 s and rebuilt the release the way CI does. Its findings, each checked against the code before changing anything:
+
+- **The closed popover kept animating** (measured: 4.7 s of CPU in 46 s, about a tenth of a core, during a generation). `LiveDot`'s `repeatForever` breathing and the models list's one-second `TimelineView` keep SwiftUI rendering after a `MenuBarExtra(.window)` closes, because the window's view outlives it. Both now follow `isPopoverOpen`: the dot replaces its animation with none through a transaction that disables animations, and the clock ticks hourly while closed. The lesson is the same one as the busy rule: the app costs most when the Mac is busiest, and only a profile shows it.
+- **The release carried `get-task-allow`.** Xcode injects it with ad-hoc signing unless `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO`; it lets any local process attach a debugger, which voids the hardened runtime the README claims. The release build passes the flag and the verify step fails if the entitlement is present.
+- **A huge number from a runtime API crashed the app**: `UInt64(Double)` traps above the maximum, and `/api/ps` with `"size": 1e30` reproduced it. Clamped; nan and negatives read as 0.
+- **The tests did not compile on Xcode 26.2**: one array-concatenation expression the type checker gave up on, split into statements.
+- A client whose name contains the runtime's (Ollamac) was hidden as the runtime's own app; the rule is now an exact, case-insensitive match. A keep-alive of forever (Ollama's `expires_at` decades out) read as a 2.5-million-hour countdown; beyond 30 days it reads "kept". A refresh rate changed in Settings applied only at the next open or close; the store now reschedules on settings changes. Two scans could overlap and diff against the same past; a scan in flight skips the next timer. A keep-alive that ran out on time was logged as "evicted"; it is "unloaded … at the end of its keep-alive" when the expiry had passed, within a minute's tolerance. Any process starting with "whisper" became a whisper.cpp row; now whisper.cpp's tool names (`whisper-*`), or a whisper-named process given a model file or living in a whisper.cpp checkout.
+- Housekeeping: MIT licence; README names the Gatekeeper "Open Anyway" step an ad-hoc signed app needs; unused design components removed (`KeyCap`, `EmptyState`, the button styles, two text styles); the runtime's version, probed since 1.0 but never shown, ends the diagnostics line; the one concurrency warning (`ClientResolver.named`) fixed.
+- Confirmed by the audit, which closes two open items: the efficiency-cores-first index assumption holds on the user's M4 (CPUs 0–5 efficiency, 6–9 performance), and the TCP-table offsets are right on the macOS 27 kernel. Scan cost about half a percent of a core; 32 MB resident.
+- Not done: one early commit carries the user's e-mail address as its author. Rewriting published history is the user's call; GitHub's "keep my email address private" setting prevents the next one. Context length and model role are still computed and not shown: a row design question for 1.1, not a bug.
 
 ## Where things stand (end of 5 Oct 2026)
 **Origin.** GyozaVitals was #4 on a list of twelve project ideas built from the models already on the user's Mac (see `docs/PROJECT-IDEAS.md` in the GyozaIsland repo). It was picked first because it is small and because every other local-model project on the list would hit the same RAM collisions it makes visible.

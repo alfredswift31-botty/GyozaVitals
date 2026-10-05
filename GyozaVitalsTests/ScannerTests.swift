@@ -232,6 +232,11 @@ struct ProcessClassifierTests {
          Classification(.whisper)),
         (record("whisper-stream", path: "/usr/local/bin/whisper-stream", ["whisper-stream", "-m", "models/ggml-base.en.bin"]),
          Classification(.whisper)),
+        // A renamed build with a model file, and one found by its checkout.
+        (record("whisper", path: "/Users/me/whisper.cpp/build/bin/whisper", ["whisper", "-m", "ggml-base.bin"]),
+         Classification(.whisper)),
+        (record("whispertool", path: "/Users/me/whisper.cpp/build/bin/whispertool", ["whispertool"]),
+         Classification(.whisper)),
         (record("LM Studio", path: "/Applications/LM Studio.app/Contents/MacOS/LM Studio", ["/Applications/LM Studio.app/Contents/MacOS/LM Studio"]),
          Classification(.lmStudio)),
         (record("LM Studio Helper", path: "/Applications/LM Studio.app/Contents/Frameworks/LM Studio Helper.app/Contents/MacOS/LM Studio Helper", ["x", "--type=utility"]),
@@ -248,6 +253,9 @@ struct ProcessClassifierTests {
         record("ollama", path: "/opt/homebrew/bin/ollama", ["ollama", "run", "llama3"]),
         record("python3", path: "/opt/homebrew/bin/python3", ["python3", "main.py"]),
         record("sd", path: "/usr/local/bin/sd", ["sd", "--help"]),
+        // Starts with "whisper", is not whisper.cpp.
+        record("whisperd", path: "/usr/libexec/whisperd", ["whisperd"]),
+        record("WhisperKit", path: "/Applications/WhisperKit.app/Contents/MacOS/WhisperKit", ["/Applications/WhisperKit.app/Contents/MacOS/WhisperKit"]),
     ]
 
     @Test(arguments: ProcessClassifierTests.otherCases) func ignoresOtherProcesses(record: ProcessRecord) {
@@ -304,9 +312,12 @@ struct ModelRoleTests {
 
     @Test func procargs2Layout() {
         var bytes: [UInt8] = [3, 0, 0, 0]
-        bytes += Array("/usr/bin/python3".utf8) + [0, 0, 0]
-        bytes += Array("python3".utf8) + [0] + Array("main.py".utf8) + [0] + Array("--listen".utf8) + [0]
-        bytes += Array("HOME=/Users/me".utf8) + [0]
+        bytes += Array("/usr/bin/python3".utf8)
+        bytes += [0, 0, 0]
+        for argument in ["python3", "main.py", "--listen", "HOME=/Users/me"] {
+            bytes += Array(argument.utf8)
+            bytes.append(0)
+        }
         #expect(ArgumentReader.parse(bytes) == ["python3", "main.py", "--listen"])
         #expect(ArgumentReader.parse([0, 0, 0, 0]) == [])
     }
@@ -1735,5 +1746,35 @@ struct RealMachineTests {
             #expect(runtime.attributionNote?.contains("table: ") == true)
             #expect(output.clientChains[curl.processIdentifier]?.dropFirst().first?.pid == getpid())
         }
+    }
+}
+
+// MARK: - Numbers from a runtime API, and the runtime's own app
+
+struct ProbeJSONTests {
+    @Test func aHugeOrOddNumberNeverTraps() {
+        #expect(JSON.uint64(NSNumber(value: 1e30)) == UInt64.max)
+        #expect(JSON.uint64(NSNumber(value: Double.infinity)) == UInt64.max)
+        #expect(JSON.uint64(NSNumber(value: Double.nan)) == 0)
+        #expect(JSON.uint64(NSNumber(value: -5)) == 0)
+        #expect(JSON.uint64(NSNumber(value: 6_550_000_000)) == 6_550_000_000)
+        #expect(JSON.uint64("6550000000") == 6_550_000_000)
+        #expect(JSON.uint64("1e30") == UInt64.max)
+        #expect(JSON.uint64("x") == nil)
+        #expect(JSON.uint64(nil) == nil)
+    }
+}
+
+@MainActor
+struct OwnAppTests {
+    private func app(_ name: String) -> ClientApp { ClientApp(pid: 7, name: name, bundleIdentifier: nil) }
+
+    @Test func onlyTheRuntimesOwnAppIsHidden() {
+        #expect(ModelScanner.isOwnApp(app("Ollama"), of: .ollama))
+        #expect(ModelScanner.isOwnApp(app("ollama"), of: .ollama))
+        #expect(!ModelScanner.isOwnApp(app("Ollamac"), of: .ollama), "a third-party client with the runtime's name in its own")
+        #expect(!ModelScanner.isOwnApp(app("Ollama Grid Search"), of: .ollama))
+        #expect(ModelScanner.isOwnApp(app("LM Studio"), of: .lmStudio))
+        #expect(!ModelScanner.isOwnApp(app("Qwen Image"), of: .sdcpp))
     }
 }

@@ -66,7 +66,17 @@ nonisolated enum ProcessClassifier {
             return nil
         }
 
-        if lowerName.hasPrefix("whisper") { return Classification(.whisper) }
+        // whisper.cpp's tools (whisper-cli, whisper-server, whisper-stream,
+        // whisper-command, ...), or anything named whisper* that was given a
+        // model file; not every process that happens to start with "whisper".
+        if lowerName == "whisper" || lowerName.hasPrefix("whisper-") || lowerName.hasPrefix("whisper.") {
+            return Classification(.whisper)
+        }
+        if lowerName.hasPrefix("whisper"),
+           arguments.contains(where: { $0.hasSuffix(".bin") || $0.hasSuffix(".gguf") || $0.hasSuffix(".mlmodelc") })
+            || lowerPath.contains("whisper.cpp") {
+            return Classification(.whisper)
+        }
 
         // LM Studio: the app and its helpers (names unverified; the inference
         // helper's name has changed across versions, so the bundle path decides).

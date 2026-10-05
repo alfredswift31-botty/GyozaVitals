@@ -22,9 +22,16 @@ nonisolated enum Formatting {
         String(format: "%.0f%%", (fraction * 100).rounded())
     }
 
-    /// "4:12" or "1:04:12" for a remaining interval; "now" once it's past.
+    /// Beyond this a runtime means "kept loaded": Ollama's keep_alive -1 is
+    /// an expiry decades away, not a timer anyone wants to read.
+    static let countdownLimit: TimeInterval = 30 * 86_400
+
+    /// "4:12" or "1:04:12" for a remaining interval; "now" once it's past;
+    /// "kept" when it is more than `countdownLimit` away.
     static func countdown(to date: Date, from now: Date = Date()) -> String {
-        let seconds = Int(date.timeIntervalSince(now).rounded())
+        let remaining = date.timeIntervalSince(now)
+        guard remaining < countdownLimit else { return "kept" }
+        let seconds = Int(remaining.rounded())
         guard seconds > 0 else { return "now" }
         let h = seconds / 3600, m = (seconds % 3600) / 60, s = seconds % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)

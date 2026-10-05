@@ -6,6 +6,9 @@ import SwiftUI
 struct ModelsSection: View {
     let models: [LoadedModel]
     let appleIntelligenceAvailable: Bool?
+    /// Whether the popover is on screen: the countdown clock and the red
+    /// dot's breathing stop with it, since the window's view outlives it.
+    var isOnScreen = true
     @Environment(\.frozenDate) private var frozenDate
 
     private var sorted: [LoadedModel] {
@@ -19,9 +22,11 @@ struct ModelsSection: View {
         }
     }
 
-    /// Only a row with an expiry needs the clock every second.
+    /// Only a row with an expiry needs the clock every second; a closed
+    /// window needs it once an hour.
     private var tick: TimeInterval {
-        models.contains { $0.expiresAt != nil } ? 1 : 60
+        guard isOnScreen else { return 3600 }
+        return models.contains { $0.expiresAt != nil } ? 1 : 60
     }
 
     var body: some View {
@@ -31,7 +36,7 @@ struct ModelsSection: View {
             } else {
                 header
                 TimelineView(.periodic(from: Date.now, by: tick)) { context in
-                    list(now: frozenDate ?? context.date)
+                    list(now: frozenDate ?? context.date, animates: isOnScreen)
                 }
             }
             Text(appleIntelligenceLine)
@@ -54,11 +59,11 @@ struct ModelsSection: View {
     }
 
     @ViewBuilder
-    private func list(now: Date) -> some View {
+    private func list(now: Date, animates: Bool) -> some View {
         let rows = sorted
         let column = VStack(spacing: 0) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, model in
-                ModelRow(model: model, now: now)
+                ModelRow(model: model, now: now, animates: animates)
                     .overlay(alignment: .bottom) {
                         if index < rows.count - 1 { Hairline() }
                     }
@@ -98,6 +103,7 @@ struct ModelsSection: View {
 struct ModelRow: View {
     let model: LoadedModel
     let now: Date
+    var animates = true
 
     private var isUnloading: Bool { model.state == .unloading }
 
@@ -105,7 +111,7 @@ struct ModelRow: View {
         VStack(alignment: .leading, spacing: Theme.Space.xs) {
             HStack(alignment: .firstTextBaseline, spacing: Theme.Space.s) {
                 if model.state == .executing {
-                    LiveDot()
+                    LiveDot(animates: animates)
                         .alignmentGuide(.firstTextBaseline) { d in d[.bottom] - 1 }
                         .accessibilityHidden(true)
                 }

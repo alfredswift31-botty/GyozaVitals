@@ -15,6 +15,7 @@ Read-only. It never loads, unloads or interrupts anything.
 Without root or private frameworks there is no CPU frequency, no Neural Engine utilisation, no per-component watts, and no view into Apple Intelligence's own model (its daemons run as root). GyozaVitals says "not observable" rather than guessing.
 
 ## Versions
+- **1.0.9** (5 Oct 2026): fixes from an independent audit: the red dot's animation and the countdown clock stop when the popover closes (it was costing about a tenth of a core during a generation); the release build no longer carries the `get-task-allow` debug entitlement; a huge number from a runtime API no longer crashes the app; refresh rates from Settings apply at once; scans never overlap; an Ollama keep-alive that ends on time is logged as unloaded, not evicted; a keep-alive of forever reads "kept"; third-party apps with the runtime's name in theirs (Ollamac) show in "used by"; only whisper.cpp's tools count as whisper; the tests compile on Xcode 26.2; MIT licence.
 - **1.0.8** (5 Oct 2026): "used by" now reads the kernel's TCP table, which keeps the pid of a closed connection after the process has exited, and a short burst records who was born and who their parent was; a helper that polls for milliseconds is attributed to its app after it is gone. The diagnostics line shows the table counts and the burst cost.
 - **1.0.7** (5 Oct 2026): "used by" catches apps that talk to their runtime through short-lived helper processes, by watching for newborn processes that connect to the runtime's port during a brief burst.
 - **1.0.6** (5 Oct 2026): the app that launched a runtime counts as its user, so "used by" no longer depends on catching a connection at the scan instant.
@@ -29,7 +30,7 @@ Without root or private frameworks there is no CPU frequency, no Neural Engine u
 macOS 15 or later on Apple silicon. Not sandboxed (reading other processes needs it), hardened runtime, ad-hoc signed.
 
 ## Install
-Download `GyozaVitals.zip` from the latest release, unzip, move to Applications, open. It lives in the menu bar; there's no Dock icon. Open at login is in Settings.
+Download `GyozaVitals.zip` from the latest release, unzip, move to Applications, open. The app is ad-hoc signed, not notarized, so the first launch is refused by Gatekeeper: open System Settings › Privacy & Security, scroll to the message about GyozaVitals and click **Open Anyway**, then open it again. It lives in the menu bar; there's no Dock icon. Open at login is in Settings.
 
 ## Development
 `docs/PLAN.md` is the architecture; `docs/DESIGN.md` the visual contract; `docs/DEVELOPMENT_LOG.md` the history. CI builds on macOS 26, runs the tests, renders every screen in light and dark and prints the images into the log; `scripts/decode-snapshots.py <log> <dir>` recovers them.

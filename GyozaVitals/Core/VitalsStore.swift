@@ -23,6 +23,7 @@ final class VitalsStore: ObservableObject {
     private var scanTimer: DispatchSourceTimer?
     private var sleeping = false
     private var observers: [NSObjectProtocol] = []
+    private var settingsObserver: AnyCancellable?
     static let maxEvents = 50
 
     init(settings: AppSettings, metrics: SystemMetricsSource, scanner: ModelScanSource) {
@@ -64,6 +65,10 @@ final class VitalsStore: ObservableObject {
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.sleeping = false; self?.reschedule() }
         })
+        // A new refresh rate in Settings applies now, not at the next open or close.
+        settingsObserver = settings.objectWillChange
+            .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.reschedule() } }
         reschedule()
         Task { await refreshAll() }
     }
@@ -74,6 +79,7 @@ final class VitalsStore: ObservableObject {
         let center = NSWorkspace.shared.notificationCenter
         observers.forEach { center.removeObserver($0) }
         observers.removeAll()
+        settingsObserver = nil
         started = false
     }
 
@@ -123,7 +129,14 @@ final class VitalsStore: ObservableObject {
     /// running as "started" at launch would date it wrongly.
     private var hasScanned = false
 
+    /// A scan in flight; a timer that fires meanwhile is skipped rather
+    /// than overlapped, which would diff two scans against the same past.
+    private var scanning = false
+
     func refreshScan() async {
+        guard !scanning else { return }
+        scanning = true
+        defer { scanning = false }
         scanner.noteSystemGPU(utilization: system?.gpu?.utilization)
         let result = await scanner.scan(watched: settings.watchedRuntimes, ports: settings.ports)
         if hasScanned {
@@ -136,16 +149,28 @@ final class VitalsStore: ObservableObject {
         lastScan = Date()
     }
 
-    private func diff(old: [LoadedModel], new: [LoadedModel], oldRuntimes: [RuntimeInstance], newRuntimes: [RuntimeInstance]) {
+    /// A model gone within this long of its expiry left on schedule: the
+    /// scan that notices is up to one closed-popover interval late.
+    static let expiryTolerance: TimeInterval = 60
+
+    private func diff(old: [LoadedModel], new: [LoadedModel], oldRuntimes: [RuntimeInstance], newRuntimes: [RuntimeInstance],
+                      now: Date = Date()) {
         let oldIDs = Set(old.map(\.id)), newIDs = Set(new.map(\.id))
         for model in new where !oldIDs.contains(model.id) {
             record(.loaded, "\(model.name) loaded in \(model.runtime.displayName)")
         }
         let newRuntimePIDs = Set(newRuntimes.map(\.pid))
         for model in old where !newIDs.contains(model.id) {
-            // Gone with its runtime: unloaded. Runtime still up: evicted.
-            let kind: ActivityKind = newRuntimePIDs.contains(model.pid) ? .evicted : .unloaded
-            record(kind, "\(model.name) \(kind == .evicted ? "evicted from" : "unloaded from") \(model.runtime.displayName)")
+            // Gone with its runtime, or at the end of its keep-alive: unloaded.
+            // Gone while its runtime is up and its time wasn't up: evicted.
+            let expired = model.expiresAt.map { $0 <= now.addingTimeInterval(Self.expiryTolerance) } ?? false
+            if !newRuntimePIDs.contains(model.pid) {
+                record(.unloaded, "\(model.name) unloaded from \(model.runtime.displayName)")
+            } else if expired {
+                record(.unloaded, "\(model.name) unloaded from \(model.runtime.displayName) at the end of its keep-alive")
+            } else {
+                record(.evicted, "\(model.name) evicted from \(model.runtime.displayName)")
+            }
         }
         let oldPIDs = Set(oldRuntimes.map(\.pid))
         for runtime in newRuntimes where !oldPIDs.contains(runtime.pid) {
