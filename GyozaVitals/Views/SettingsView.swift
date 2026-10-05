@@ -90,7 +90,7 @@ struct SettingsView: View {
 
     private static let dash = "\u{2013}"
 
-    /// "sd.cpp pid 1234 · api: no api · cpu 0.012 · gpu 1.00 · candidate · decided by gpu".
+    /// "sd.cpp pid 1234 · api: no api · cpu 0.012 · gpu 1.00 · candidate · decided by gpu · clients: caught 1 poller".
     static func diagnosticsLine(_ runtime: RuntimeInstance) -> String {
         let d = runtime.diagnostics
         let candidate = d.map { $0.candidate ? "candidate" : "not a candidate" } ?? "candidate \(dash)"
@@ -101,6 +101,7 @@ struct SettingsView: View {
             "gpu \(Formatting.fraction(d?.gpuUtilization, decimals: 2))",
             candidate,
             "decided by \(d?.decidedBy ?? dash)",
+            "clients: \(runtime.attributionNote ?? dash)",
         ].joined(separator: " · ")
     }
 

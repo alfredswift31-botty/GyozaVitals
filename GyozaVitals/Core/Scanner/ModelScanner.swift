@@ -108,12 +108,18 @@ struct ClientResolver {
 /// One scan, start to finish, off the main actor.
 actor ScanPipeline {
     private let client = HTTPClient()
+    private let pollerCatcher = PollerCatcher()
     private var manifestNames: [String: String] = [:]
     private var manifestRoots: [String] = []
     private var manifestsBuiltAt = Date.distantPast
     private var cpuActivity = CPUActivity()
     /// What the APIs said last scan, by model id, for a scan where they don't answer.
     private var apiModels: [String: LoadedModel] = [:]
+    /// Last scan's busy verdict per runtime: the burst decision is made
+    /// before this scan's probes have answered.
+    private var lastBusy: [pid_t: Bool] = [:]
+    /// When each runtime was last watched for pollers.
+    private var lastBurst: [pid_t: Date] = [:]
 
     /// Each probe gets this long (its GETs time out at `HTTPClient.defaultTimeout`
     /// and run concurrently); the file fallback answers for a slower one.
@@ -129,6 +135,11 @@ actor ScanPipeline {
     static let genericCandidateLimit = 40
     /// A process younger than this may still be loading its model.
     static let youngProcessSeconds: TimeInterval = 20
+    /// How long a runtime is watched for pollers, concurrently with the probes.
+    static let burstDuration: TimeInterval = 1.2
+    /// A runtime is watched at most this often: a catch stays sticky for
+    /// `StickyClients.memory`, twice this.
+    static let burstCooldown: TimeInterval = 30
 
     func run(watched: Set<RuntimeKind>, ports: [RuntimeKind: Int], gpuUtilization: Double? = nil) async -> PipelineOutput {
         let selfPID = getpid()
@@ -148,6 +159,33 @@ actor ScanPipeline {
         let manifests = await ollamaManifests(for: drafts)
         let cpuDeltas = cpuActivity.observe(drafts.flatMap { $0.allProcesses.map(\.record) }, at: sampledAt)
 
+        // Who is connected to which port, before the probes: the burst
+        // decision needs it.
+        let allPorts = Set(drafts.flatMap { $0.allListeningPorts })
+        let connections = ClientFinder.connections(to: allPorts, among: processes)
+
+        // A busy runtime that no connection or launcher names is driven by
+        // something this scan can't see: watch for its pollers while the
+        // probes run. Last scan's verdict stands in for this scan's, which
+        // the probes haven't given yet; a quarter of a core now counts too.
+        let now = Date()
+        var burstPorts = Set<Int>()
+        for draft in drafts {
+            let pid = draft.process.pid
+            var scratch: [pid_t: [ProcessChainLink]] = [:]
+            let visible = Self.attribution(for: draft, connections: connections, processes: byPID, pollers: [],
+                                           excluding: draft.pids.union([selfPID]), chains: &scratch)
+            let busy = lastBusy[pid] == true || CPUActivity.busy(deltas: draft.pids.compactMap { cpuDeltas[$0] }) == true
+            guard Self.shouldBurst(ports: draft.allListeningPorts, hasClient: visible.hasClient, isBusy: busy,
+                                   lastBurst: lastBurst[pid], now: now) else { continue }
+            lastBurst[pid] = now
+            burstPorts.formUnion(draft.allListeningPorts)
+        }
+        let catcher = pollerCatcher
+        let known = Set(processes.map(\.pid))
+        let portsToWatch = burstPorts
+        async let burst = catcher.catchPollers(ports: portsToWatch, among: known, processes: byPID, duration: Self.burstDuration)
+
         // Probe every draft at once, each within its deadline.
         let client = self.client
         let results = await withTaskGroup(of: (pid_t, ProbeResult).self, returning: [pid_t: ProbeResult].self) { group in
@@ -164,24 +202,46 @@ actor ScanPipeline {
             return results
         }
 
-        // Who is connected to which port.
-        let allPorts = Set(drafts.flatMap { $0.allListeningPorts })
-        let connections = ClientFinder.connections(to: allPorts, among: processes)
-
+        let pollers = Self.pollers(await burst, for: drafts)
         let output = Self.assemble(drafts: drafts, results: results, manifests: manifests, connections: connections,
-                                   processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID,
+                                   processes: byPID, cpuDeltas: cpuDeltas, selfPID: selfPID, pollers: pollers,
                                    gpuUtilization: gpuUtilization, previous: apiModels, now: Date())
         apiModels = output.apiModels
+        let live = Set(output.result.runtimes.map(\.pid))
+        lastBusy = Dictionary(output.result.runtimes.map { ($0.pid, $0.isBusy ?? false) }, uniquingKeysWith: { first, _ in first })
+        lastBurst = lastBurst.filter { live.contains($0.key) }
         return output
+    }
+
+    /// Whether to spend a burst on a runtime: it listens somewhere (a), no
+    /// connection or launcher names a client (b), it is busy (c): polls
+    /// happen during a generation, and it hasn't been watched within
+    /// `burstCooldown` (d): the main actor keeps a catch sticky for a minute.
+    static func shouldBurst(ports: Set<Int>, hasClient: Bool, isBusy: Bool, lastBurst: Date?, now: Date) -> Bool {
+        guard !ports.isEmpty, !hasClient, isBusy else { return false }
+        if let lastBurst, now.timeIntervalSince(lastBurst) < burstCooldown { return false }
+        return true
+    }
+
+    /// Caught pollers by the pid of the runtime whose port they connected to.
+    static func pollers(_ caught: [CaughtPoller], for drafts: [RuntimeDraft]) -> [pid_t: [CaughtPoller]] {
+        var result: [pid_t: [CaughtPoller]] = [:]
+        for poller in caught {
+            for draft in drafts where draft.allListeningPorts.contains(poller.port) {
+                result[draft.process.pid, default: []].append(poller)
+            }
+        }
+        return result
     }
 
     /// Runtimes and models from what was found, pure: drafts, what their
     /// probes said, who connects to their ports, how much CPU they used
-    /// since the last scan, the system GPU, and what the APIs said last time
-    /// (`previous`, by model id) for a probe that didn't answer now.
+    /// since the last scan, the pollers caught per runtime pid, the system
+    /// GPU, and what the APIs said last time (`previous`, by model id) for a
+    /// probe that didn't answer now.
     static func assemble(drafts: [RuntimeDraft], results: [pid_t: ProbeResult], manifests: [String: String],
                          connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
-                         cpuDeltas: [pid_t: CPUActivity.Delta], selfPID: pid_t,
+                         cpuDeltas: [pid_t: CPUActivity.Delta], selfPID: pid_t, pollers: [pid_t: [CaughtPoller]] = [:],
                          gpuUtilization: Double? = nil, previous: [String: LoadedModel] = [:], now: Date = Date()) -> PipelineOutput {
         var runtimes: [RuntimeInstance] = []
         var models: [LoadedModel] = []
@@ -214,8 +274,9 @@ actor ScanPipeline {
         for draft in drafts {
             let pid = draft.process.pid
             let probe = probes[pid] ?? .nothing
-            let clients = Self.clients(for: draft, connections: connections, processes: byPID,
-                                       excluding: draft.pids.union([selfPID]), chains: &chains)
+            let attribution = Self.attribution(for: draft, connections: connections, processes: byPID, pollers: pollers[pid] ?? [],
+                                               excluding: draft.pids.union([selfPID]), chains: &chains)
+            let clients = attribution.clients
             let share = shares[pid] ?? nil
             let candidate = candidates[pid] != nil
 
@@ -245,7 +306,7 @@ actor ScanPipeline {
                 executablePath: draft.process.record.executablePath, listeningPorts: draft.process.listeningPorts,
                 version: probe.version, footprintBytes: draft.footprintBytes, isBusy: isBusy, clients: clients,
                 diagnostics: BusyDiagnostics(cpuShare: share, gpuUtilization: gpuUtilization, candidate: candidate, decidedBy: decidedBy),
-                probeNote: probeNote(for: draft, probe: probe, previous: previous)))
+                probeNote: probeNote(for: draft, probe: probe, previous: previous), attributionNote: attribution.note))
             models += probedModels.map { model in
                 var model = model
                 model.clients = clients
@@ -417,20 +478,46 @@ actor ScanPipeline {
 
     // MARK: Clients
 
+    /// One runtime's clients and where they came from, for the diagnostics.
+    nonisolated struct Attribution: Sendable {
+        var clients: [ClientApp] = []
+        /// Processes with a connection open at the scan instant.
+        var connected = 0
+        /// The process that launched the runtime counts.
+        var launcher = false
+        /// Short-lived processes the burst caught connecting.
+        var caught = 0
+
+        var hasClient: Bool { !clients.isEmpty }
+
+        /// "2 connected, launcher, caught 1 poller", or "no client seen".
+        var note: String {
+            var parts: [String] = []
+            if connected > 0 { parts.append("\(connected) connected") }
+            if launcher { parts.append("launcher") }
+            if caught > 0 { parts.append("caught \(caught) \(caught == 1 ? "poller" : "pollers")") }
+            return parts.isEmpty ? "no client seen" : parts.joined(separator: ", ")
+        }
+    }
+
     /// The connecting processes, as executable names; the main actor resolves
     /// them to apps through their parent chains, which are recorded here. A
     /// process whose chain passes through the runtime itself is its child,
     /// not a client (Ollama talking to its runner, a server's own worker).
-    private static func clients(for draft: RuntimeDraft, connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
-                                excluding: Set<pid_t>, chains: inout [pid_t: [ProcessChainLink]]) -> [ClientApp] {
+    /// Three sources: connections open now, the runtime's launcher, and the
+    /// pollers a burst caught (see `PollerCatcher`), each once per pid.
+    static func attribution(for draft: RuntimeDraft, connections: [Int: [ProcessRecord]], processes byPID: [pid_t: ProcessRecord],
+                            pollers: [CaughtPoller], excluding: Set<pid_t>, chains: inout [pid_t: [ProcessChainLink]]) -> Attribution {
         var seen = Set<pid_t>()
         var clients: [ClientApp] = []
+        var attribution = Attribution()
         for port in draft.allListeningPorts.sorted() {
             for process in connections[port] ?? [] where !excluding.contains(process.pid) && seen.insert(process.pid).inserted {
                 let chain = chains[process.pid] ?? ClientFinder.chain(from: process, among: byPID)
                 guard !ClientFinder.chain(chain, passesThrough: excluding) else { continue }
                 chains[process.pid] = chain
                 clients.append(ClientFinder.client(for: process))
+                attribution.connected += 1
             }
         }
         // The process that launched the runtime uses it too, and that fact
@@ -444,9 +531,21 @@ actor ScanPipeline {
             if let first = chain.first, !ClientFinder.isBoundary(first) {
                 chains[parent.pid] = chain
                 clients.append(ClientFinder.client(for: parent))
+                attribution.launcher = true
             }
         }
-        return clients.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        // A poller caught mid-request is a connecting process that happened
+        // to live for milliseconds: same chain rules, same resolution.
+        for poller in pollers where !excluding.contains(poller.pid) && seen.insert(poller.pid).inserted {
+            let chain = poller.chain.isEmpty
+                ? [ProcessChainLink(pid: poller.pid, name: poller.name, executablePath: poller.executablePath)] : poller.chain
+            guard !ClientFinder.chain(chain, passesThrough: excluding) else { continue }
+            chains[poller.pid] = chain
+            clients.append(ClientApp(pid: poller.pid, name: poller.name, bundleIdentifier: nil))
+            attribution.caught += 1
+        }
+        attribution.clients = clients.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return attribution
     }
 
     // MARK: Ollama manifests

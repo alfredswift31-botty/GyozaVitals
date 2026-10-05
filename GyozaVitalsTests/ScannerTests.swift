@@ -1320,3 +1320,221 @@ struct UpscalerFileTests {
         #expect(classified.count == 4, "a classified runtime's floor is lower than all of them")
     }
 }
+
+// MARK: - Poller catcher: clients that live for milliseconds
+
+struct PollerCatcherTests {
+    /// A loopback listener that accepts in the background and hangs up a
+    /// moment later, so curl neither stalls on its request nor vanishes
+    /// between the catcher's ticks.
+    private final class Listener: @unchecked Sendable {
+        let fd: Int32
+        let port: Int
+
+        init() throws {
+            let server = socket(AF_INET, SOCK_STREAM, 0)
+            try #require(server >= 0)
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = 0
+            address.sin_addr.s_addr = UInt32(0x7f00_0001).bigEndian
+            let size = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let bound = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(server, $0, size) }
+            }
+            try #require(bound == 0)
+            try #require(listen(server, 8) == 0)
+            var length = size
+            let named = withUnsafeMutablePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(server, $0, &length) }
+            }
+            try #require(named == 0)
+            let port = Int(UInt16(bigEndian: address.sin_port))
+            try #require(port > 0)
+            self.fd = server
+            self.port = port
+            Thread {
+                while true {
+                    let connection = accept(server, nil, nil)
+                    guard connection >= 0 else { break }
+                    usleep(150_000)
+                    close(connection)
+                }
+            }.start()
+        }
+
+        func stop() {
+            shutdown(fd, SHUT_RDWR)
+            close(fd)
+        }
+    }
+
+    /// Fire and forget: curl connects, sends its request and exits when the
+    /// listener hangs up (or after 2 s). It is never signalled.
+    private static func spawnCurl(port: Int) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["-s", "-m", "2", "http://127.0.0.1:\(port)/"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        return process
+    }
+
+    /// One burst of a second, with three curls spawned 200, 300 and 400 ms in.
+    private static func burst(_ catcher: PollerCatcher, port: Int, processes byPID: [pid_t: ProcessRecord]) async throws -> [CaughtPoller] {
+        let known = Set(ProcessList.allPIDs())
+        async let caught = catcher.catchPollers(ports: [port], among: known, processes: byPID, duration: 1.0)
+        try await Task.sleep(for: .milliseconds(200))
+        var curls: [Process] = []
+        for _ in 0..<3 {
+            curls.append(try spawnCurl(port: port))
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let result = await caught
+        withExtendedLifetime(curls) {}
+        return result
+    }
+
+    @Test func catchesCurlConnectingToOurListener() async throws {
+        let listener = try Listener()
+        defer { listener.stop() }
+        let byPID = Dictionary(ProcessList.currentUserProcesses().map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        let catcher = PollerCatcher()
+        var caught = try await Self.burst(catcher, port: listener.port, processes: byPID)
+        // CI runners are slow; one more try before giving up.
+        if !caught.contains(where: { $0.name == "curl" }) { caught = try await Self.burst(catcher, port: listener.port, processes: byPID) }
+        let curl = try #require(caught.first { $0.name == "curl" }, "caught: \(caught)")
+        #expect(curl.port == listener.port)
+        #expect(curl.parentPID == getpid())
+        #expect(curl.executablePath?.hasSuffix("/curl") == true)
+        #expect(curl.chain.first?.pid == curl.pid)
+        #expect(curl.chain.first?.name == "curl")
+        #expect(curl.chain.dropFirst().first?.pid == getpid(), "chain: \(curl.chain.map(\.pid))")
+        #expect(caught.allSatisfy { $0.port == listener.port })
+        #expect(!caught.contains { $0.pid == getpid() }, "the test process itself is known, never a newborn")
+    }
+
+    @Test func nothingIsCaughtWithoutPortsOrConnections() async {
+        let catcher = PollerCatcher()
+        let none = await catcher.catchPollers(ports: [], among: [], duration: 1)
+        #expect(none.isEmpty)
+        // An unused port, a very short burst: whatever is born connects elsewhere.
+        let quiet = await catcher.catchPollers(ports: [1], among: Set(ProcessList.allPIDs()), duration: 0.1)
+        #expect(quiet.isEmpty)
+    }
+
+    @Test func aSocketMatchesInAnyStateButListening() {
+        let ports: Set<Int> = [1235]
+        func tcp(_ state: TCPSocket.State, remote: Int, loopback: Bool = true) -> TCPSocket {
+            TCPSocket(state: state, localPort: 50_000, remotePort: remote, localIsLoopback: loopback, remoteIsLoopback: loopback)
+        }
+        #expect(PollerCatcher.matches(tcp(.established, remote: 1235), ports: ports))
+        #expect(PollerCatcher.matches(tcp(.other, remote: 1235), ports: ports), "SYN_SENT and CLOSE_WAIT count")
+        #expect(!PollerCatcher.matches(tcp(.listening, remote: 0), ports: ports))
+        #expect(!PollerCatcher.matches(tcp(.established, remote: 443), ports: ports))
+        #expect(!PollerCatcher.matches(tcp(.established, remote: 1235, loopback: false), ports: ports))
+    }
+
+    @Test func theBurstRuleNeedsPortsNoClientBusyAndACooldown() {
+        let now = Date()
+        let table: [(ports: Set<Int>, hasClient: Bool, isBusy: Bool, lastBurst: Date?, expected: Bool, why: String)] = [
+            ([1235], false, true, nil, true, "busy, listening, nobody seen: burst"),
+            ([], false, true, nil, false, "no port: nothing to connect to"),
+            ([1235], true, true, nil, false, "a connection or launcher already names the client"),
+            ([1235], false, false, nil, false, "idle: no polls to catch"),
+            ([1235], false, true, now.addingTimeInterval(-10), false, "watched 10 s ago: sticky clients still hold"),
+            ([1235], false, true, now.addingTimeInterval(-ScanPipeline.burstCooldown), true, "the cooldown is over"),
+        ]
+        for row in table {
+            let decision = ScanPipeline.shouldBurst(ports: row.ports, hasClient: row.hasClient, isBusy: row.isBusy, lastBurst: row.lastBurst, now: now)
+            #expect(decision == row.expected, Comment(rawValue: row.why))
+        }
+    }
+
+    static func sdServer() -> RuntimeDraft {
+        // Launched by launchd, as on the owner's Mac: the launcher rule names nobody.
+        let sd = ScanAssemblyTests.process(300, parent: 1, "sd-server", "/Users/me/sd/sd-server", ["sd-server", "--port", "1235"],
+                                           kind: Classification(.sdcpp), files: ScanAssemblyTests.sdFiles, ports: [1235])
+        return RuntimeDraft(kind: .sdcpp, process: sd, helpers: [], probePort: 1235)
+    }
+
+    @Test func pollersAreHandedToTheRuntimeOnTheirPort() {
+        let sd = Self.sdServer()
+        let other = ScanAssemblyTests.process(400, "llama-server", "/opt/homebrew/bin/llama-server", ["llama-server"],
+                                              kind: Classification(.llamaServer), ports: [8080])
+        let llama = RuntimeDraft(kind: .llamaServer, process: other, helpers: [], probePort: 8080)
+        let a = CaughtPoller(pid: 1, name: "curl", executablePath: nil, parentPID: 50, port: 1235, chain: [])
+        let b = CaughtPoller(pid: 2, name: "curl", executablePath: nil, parentPID: 50, port: 8080, chain: [])
+        let stray = CaughtPoller(pid: 3, name: "curl", executablePath: nil, parentPID: 50, port: 9, chain: [])
+        let byRuntime = ScanPipeline.pollers([a, b, stray], for: [sd, llama])
+        #expect(byRuntime[300]?.map(\.pid) == [1])
+        #expect(byRuntime[400]?.map(\.pid) == [2])
+        #expect(byRuntime.count == 2)
+    }
+
+    /// The owner's case: sd-server under launchd, no connection at the scan
+    /// instant, a helper per progress poll. The caught helper is a client,
+    /// its chain resolves to the app, and sticky memory keeps it.
+    @Test func aCaughtPollerBecomesAClientOfItsRuntime() throws {
+        let draft = Self.sdServer()
+        let app = ProcessRecord(pid: 50, parentPID: 1, uid: 501, name: "Qwen Image", executablePath: ClientResolutionTests.qwen,
+                                arguments: [ClientResolutionTests.qwen], startTime: 1_790_000_000, footprintBytes: 1)
+        let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app].map { ($0.pid, $0) })
+        let helper = CaughtPoller(pid: 38385, name: "curl", executablePath: "/usr/bin/curl", parentPID: 50, port: 1235,
+                                  chain: [ProcessChainLink(pid: 38385, name: "curl", executablePath: "/usr/bin/curl"), ProcessChainLink(app)])
+        // The server's own worker connecting back to it is not a client.
+        let worker = CaughtPoller(pid: 301, name: "sd-worker", executablePath: "/Users/me/sd/sd-worker", parentPID: 300, port: 1235,
+                                  chain: [ProcessChainLink(pid: 301, name: "sd-worker", executablePath: "/Users/me/sd/sd-worker"),
+                                          ProcessChainLink(draft.process.record)])
+        let output = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:], processes: byPID,
+                                           cpuDeltas: [:], selfPID: 1, pollers: [300: [helper, worker]])
+        let runtime = try #require(output.result.runtimes.first)
+        #expect(runtime.clients.map(\.pid) == [38385])
+        #expect(runtime.clients.first?.name == "curl")
+        #expect(runtime.attributionNote == "caught 1 poller")
+        #expect(output.clientChains[38385]?.map(\.pid) == [38385, 50])
+        #expect(output.clientChains[301] == nil)
+        #expect(output.result.models.count == ScanAssemblyTests.sdFiles.count)
+        #expect(output.result.models.allSatisfy { $0.clients.map(\.pid) == [38385] })
+
+        // The main actor's resolution, without NSRunningApplication: the chain names the app.
+        let resolved = try #require(ClientFinder.resolveApp(chain: output.clientChains[38385] ?? []))
+        #expect(resolved.app.name == "Qwen Image")
+        #expect(resolved.app.pid == 50)
+
+        // Between bursts, the catch stays for a minute.
+        var sticky = StickyClients()
+        let now = Date()
+        let shown = sticky.update(pid: 300, seen: [resolved.app], now: now)
+        #expect(shown.map(\.name) == ["Qwen Image"])
+        #expect(sticky.update(pid: 300, seen: [], now: now.addingTimeInterval(45)) == shown)
+        #expect(sticky.update(pid: 300, seen: [], now: now.addingTimeInterval(61)).isEmpty)
+    }
+
+    @Test func theAttributionNoteNamesTheSources() {
+        // Nobody: launchd above, no connection, nothing caught.
+        let alone = ScanPipeline.assemble(drafts: [Self.sdServer()], results: [:], manifests: [:], connections: [:], processes: [:],
+                                          cpuDeltas: [:], selfPID: 1)
+        #expect(alone.result.runtimes.first?.attributionNote == "no client seen")
+
+        // A connection and the launcher, as in 1.0.6.
+        let draft = ScanAssemblyTests.sdDraft()
+        let app = ProcessRecord(pid: 50, parentPID: 1, uid: 501, name: "Qwen Image", executablePath: ClientResolutionTests.qwen,
+                                arguments: [ClientResolutionTests.qwen], startTime: 1_790_000_000, footprintBytes: 1)
+        let curl = ProcessRecord(pid: 900, parentPID: 1, uid: 501, name: "curl", executablePath: "/usr/bin/curl", arguments: ["curl"],
+                                 startTime: 1_790_000_000, footprintBytes: 1)
+        let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app, curl].map { ($0.pid, $0) })
+        let both = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [7860: [curl]], processes: byPID,
+                                         cpuDeltas: [:], selfPID: 1)
+        #expect(both.result.runtimes.first?.attributionNote == "1 connected, launcher")
+
+        // A poller already connected is counted once, as a connection.
+        let poller = CaughtPoller(pid: 900, name: "curl", executablePath: "/usr/bin/curl", parentPID: 1, port: 7860, chain: [])
+        let once = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [7860: [curl]], processes: byPID,
+                                         cpuDeltas: [:], selfPID: 1, pollers: [300: [poller]])
+        #expect(once.result.runtimes.first?.attributionNote == "1 connected, launcher")
+        #expect(once.result.runtimes.first?.clients.map(\.pid) == [900, 50])
+    }
+}

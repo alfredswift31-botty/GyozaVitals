@@ -61,6 +61,9 @@ nonisolated struct RuntimeInstance: Identifiable, Hashable, Sendable {
     /// How the probe went: "api answered", "api timed out, carried over",
     /// "no api", "no port".
     var probeNote: String? = nil
+    /// Where this scan's clients came from: "2 connected, launcher",
+    /// "caught 1 poller", "no client seen". Nil before the scanner has run.
+    var attributionNote: String? = nil
 }
 
 /// The inputs and the outcome of the busy heuristic for one runtime, shown
