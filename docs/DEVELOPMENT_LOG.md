@@ -14,6 +14,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | 1.0.5 | 2026-10-05 | [v1.0.5](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.5) |
 | 1.0.6 | 2026-10-05 | [v1.0.6](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.6) |
 | 1.0.7 | 2026-10-05 | [v1.0.7](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.7) |
+| 1.0.8 | 2026-10-05 | [v1.0.8](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.8) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
