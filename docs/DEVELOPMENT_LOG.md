@@ -129,6 +129,9 @@ The fix uses what survives a helper's death instead of racing it.
 The end-to-end test spawns `curl` against a listener in the test process that answers and waits for curl to hang up (as a keep-alive server does; the client is the active closer, so its half of the connection is what stays), runs the burst meanwhile, waits for curl to exit, and then attributes the dead curl to the test process through the table and the ledger. Not verifiable on CI: the owner's helper tree (whether the pollers are direct children of Qwen Image or go through a shell), and whether a poll lands in a 1.2 s burst window; the diagnostics line will say.
 
 
+
+One more measurement from CI, on the first develop run: a 5 ms tick can see a spawned child before its exec has completed, so the ledger recorded `curl` under the test process's own name and path. Attribution did not care (it walks pids), but the diagnostics name would have been the parent's. A newborn is now re-read on the following ticks for 50 ms and the later image wins.
+
 ## Where things stand (end of 2 Oct 2026)
 **Origin.** GyozaVitals was #4 on a list of twelve project ideas built from the models already on the user's Mac (see `docs/PROJECT-IDEAS.md` in the GyozaIsland repo). It was picked first because it is small and because every other local-model project on the list would hit the same RAM collisions it makes visible.
 

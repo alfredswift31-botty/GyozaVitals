@@ -117,6 +117,10 @@ actor PollerCatcher {
     /// `slowestInterval`: a slow machine is not asked for 240 listings.
     static let costlyTick: TimeInterval = 0.001
     static let slowestInterval: TimeInterval = 0.02
+    /// How long after first sight a newborn's name and path are re-read:
+    /// posix_spawn's exec is done within a few milliseconds of the child
+    /// appearing, and a helper that lives longer than this has its own image.
+    static let execWindow: TimeInterval = 0.05
 
     /// Processes born during the next `duration` seconds that belong to the
     /// current user. `known` seeds the seen set (the pipeline's process
@@ -129,7 +133,12 @@ actor PollerCatcher {
         let deadline = clock.now + .seconds(duration)
         var seen = known
         seen.insert(getpid())
-        var newborns: [Newborn] = []
+        var newborns: [pid_t: Newborn] = [:]
+        // Newborns whose image may still be the parent's: a 5 ms tick can
+        // see a spawned child before its exec has completed, under the
+        // parent's name and path. They are re-read on the following ticks
+        // for `execWindow`, and the later image wins.
+        var settling: [pid_t: ContinuousClock.Instant] = [:]
         var cpuSeconds = 0.0
         var ticks = 0
         var interval = interval
@@ -138,10 +147,21 @@ actor PollerCatcher {
             // One tick runs on one thread without suspending, so its own
             // thread's CPU time, before and after, is what the tick cost.
             let before = Self.threadCPUSeconds()
+            let now = clock.now
             for pid in ProcessList.allPIDs() where pid > 0 && !seen.contains(pid) {
                 seen.insert(pid)
                 guard let info = ProcessList.bsdInfo(pid), info.pbi_uid == uid else { continue }
-                newborns.append(Self.newborn(pid: pid, info: info, at: Date()))
+                newborns[pid] = Self.newborn(pid: pid, info: info, at: Date())
+                settling[pid] = now
+            }
+            for (pid, since) in settling {
+                guard since.duration(to: now) < .seconds(Self.execWindow) else { settling[pid] = nil; continue }
+                guard let known = newborns[pid], let info = ProcessList.bsdInfo(pid) else { settling[pid] = nil; continue }
+                let again = Self.newborn(pid: pid, info: info, at: known.bornAt)
+                if again.name != known.name || again.executablePath != known.executablePath {
+                    newborns[pid] = again
+                    settling[pid] = nil
+                }
             }
             let cost = max(0, Self.threadCPUSeconds() - before)
             cpuSeconds += cost
@@ -150,7 +170,7 @@ actor PollerCatcher {
             guard clock.now < deadline, !Task.isCancelled else { break }
             do { try await Task.sleep(for: .seconds(interval)) } catch { break }
         }
-        return Burst(newborns: newborns, cpuSeconds: cpuSeconds, ticks: ticks, interval: interval)
+        return Burst(newborns: newborns.values.sorted { $0.bornAt < $1.bornAt }, cpuSeconds: cpuSeconds, ticks: ticks, interval: interval)
     }
 
     /// User plus system time of the calling thread, from `thread_info`.
