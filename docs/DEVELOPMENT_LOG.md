@@ -12,6 +12,7 @@ GyozaVitals is a macOS menu-bar monitor for local AI models: what's loaded, in w
 | 1.0.3 | 2026-10-02 | [v1.0.3](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.3) |
 | 1.0.4 | 2026-10-02 | [v1.0.4](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.4) |
 | 1.0.5 | 2026-10-05 | [v1.0.5](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.5) |
+| 1.0.6 | 2026-10-05 | [v1.0.6](https://github.com/alfredswift31-botty/GyozaVitals/releases/tag/v1.0.6) |
 
 ## The brief (1 Oct 2026)
 The user runs five local-model projects on one Mac (Ollama for Flow and a character bot, koboldcpp, whisper.cpp, ComfyUI/Qwen Image) and asked for "a menubar utility app for the LLM status and usage and every system details at the tip of the top menu bar": which model is loading, RAM, CPU, "all the system stuff", and which app is using which model. Not an Ollama front end; a dedicated app across runtimes. Minimalist, in the Swiss style of GyozaYap, using the taste-skill.
@@ -103,6 +104,9 @@ Also confirmed by the 1.0.2 prompt-helper screenshot: one Ollama row, a live unl
 
 ## 1.0.5: clients between polls (5 Oct 2026)
 A health check from the user three days on: red dots on all sd.cpp rows with `cpu 0.022 · gpu 1.00 · decided by gpu`, whisper and the idle Ollama correctly not candidates, memory summing to 16 GB, pressure warnings logged with times. One gap: the sd.cpp rows read `sd.cpp · gpu` with no `· Qwen Image`, where earlier scans had shown the app. Attribution was point-in-time: only connections open at the scan instant. An app that drives its runtime with short polling requests is usually between polls when a scan lands. `StickyClients` now keeps a runtime's last non-empty client list for 60 s after the last sighting, and forgets runtimes that are gone so a reused pid can't inherit clients. Trade-off, deliberate: an app that quits can linger on a row for up to a minute.
+
+## 1.0.6: the launcher is a client (5 Oct 2026)
+1.0.5 freshly launched, image generating: the sd.cpp rows still read `sd.cpp · gpu` with no app. Sticky clients only help after one sighting, and a 5 s sampler can go minutes without catching a request that lasts milliseconds. The stronger signal was unused: the runtime's own parent chain. sd-server was launched by Qwen Image, and that is true on every scan. `clients(for:)` now adds the runtime's launcher, resolved through the same chain logic as a connecting process, unless the parent is a boundary (a shell, launchd). The runtime's own app is excluded on the main actor by name (Ollama.app launching `ollama serve` is not Ollama's client). Connections remain the second source, so a tool like `curl` still shows.
 
 ## Where things stand (end of 2 Oct 2026)
 **Origin.** GyozaVitals was #4 on a list of twelve project ideas built from the models already on the user's Mac (see `docs/PROJECT-IDEAS.md` in the GyozaIsland repo). It was picked first because it is small and because every other local-model project on the list would hit the same RAM collisions it makes visible.

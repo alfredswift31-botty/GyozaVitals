@@ -1008,6 +1008,37 @@ struct ScanAssemblyTests {
         #expect(resolved.map(\.name) == ["curl", "Qwen Image"])
         #expect(resolved.last?.pid == 50)
     }
+
+    /// No connection open at the scan instant, as with an app that polls its
+    /// server in short requests: the app that launched the runtime is still
+    /// its client, through the parent chain.
+    @Test func theLauncherIsAClientWithoutAConnection() {
+        let draft = Self.sdDraft()
+        func record(_ pid: pid_t, parent: pid_t, _ name: String, _ path: String) -> ProcessRecord {
+            ProcessRecord(pid: pid, parentPID: parent, uid: 501, name: name, executablePath: path, arguments: [path],
+                          startTime: 1_790_000_000, footprintBytes: 1)
+        }
+        let app = record(50, parent: 1, "Qwen Image", ClientResolutionTests.qwen)
+        let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, app].map { ($0.pid, $0) })
+        let output = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:],
+                                           processes: byPID, cpuDeltas: [:], selfPID: 1)
+        let clients = output.result.runtimes.first?.clients ?? []
+        #expect(clients.map(\.pid) == [50])
+        #expect(output.clientChains[50]?.map(\.pid) == [50])
+        let resolved = ClientFinder.resolveApp(chain: output.clientChains[50] ?? [])
+        #expect(resolved?.app.name == "Qwen Image")
+    }
+
+    /// A runtime started from a shell names nobody: the shell is a boundary.
+    @Test func aShellParentIsNotAClient() {
+        let draft = Self.sdDraft()
+        let shell = ProcessRecord(pid: 50, parentPID: 1, uid: 501, name: "zsh", executablePath: "/bin/zsh", arguments: ["-zsh"],
+                                  startTime: 1_790_000_000, footprintBytes: 1)
+        let byPID = Dictionary(uniqueKeysWithValues: [draft.process.record, shell].map { ($0.pid, $0) })
+        let output = ScanPipeline.assemble(drafts: [draft], results: [:], manifests: [:], connections: [:],
+                                           processes: byPID, cpuDeltas: [:], selfPID: 1)
+        #expect(output.result.runtimes.first?.clients.isEmpty == true)
+    }
 }
 
 // MARK: - Ollama: one model per (server, model), whichever path found it

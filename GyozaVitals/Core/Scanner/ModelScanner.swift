@@ -32,7 +32,10 @@ final class ModelScanner: ModelScanSource {
         var byRuntime: [pid_t: [ClientApp]] = [:]
         result.runtimes = result.runtimes.map { runtime in
             var runtime = runtime
-            runtime.clients = stickyClients.update(pid: runtime.pid, seen: resolver.resolve(runtime.clients), now: now)
+            // A runtime's own app isn't its client: Ollama.app launches `ollama serve`.
+            let own = runtime.kind.displayName.lowercased()
+            let seen = resolver.resolve(runtime.clients).filter { !$0.name.lowercased().contains(own) }
+            runtime.clients = stickyClients.update(pid: runtime.pid, seen: seen, now: now)
             byRuntime[runtime.pid] = runtime.clients
             return runtime
         }
@@ -428,6 +431,19 @@ actor ScanPipeline {
                 guard !ClientFinder.chain(chain, passesThrough: excluding) else { continue }
                 chains[process.pid] = chain
                 clients.append(ClientFinder.client(for: process))
+            }
+        }
+        // The process that launched the runtime uses it too, and that fact
+        // holds on every scan. An app that spawns sd-server and polls it with
+        // short requests is between polls when most scans land, so a socket
+        // may never be caught; its parent chain is always there. A shell or
+        // launchd as the parent is a boundary and names nobody.
+        if let parent = byPID[draft.process.record.parentPID], parent.pid > 1,
+           !excluding.contains(parent.pid), seen.insert(parent.pid).inserted {
+            let chain = chains[parent.pid] ?? ClientFinder.chain(from: parent, among: byPID)
+            if let first = chain.first, !ClientFinder.isBoundary(first) {
+                chains[parent.pid] = chain
+                clients.append(ClientFinder.client(for: parent))
             }
         }
         return clients.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }

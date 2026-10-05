@@ -15,6 +15,7 @@ Read-only. It never loads, unloads or interrupts anything.
 Without root or private frameworks there is no CPU frequency, no Neural Engine utilisation, no per-component watts, and no view into Apple Intelligence's own model (its daemons run as root). GyozaVitals says "not observable" rather than guessing.
 
 ## Versions
+- **1.0.6** (5 Oct 2026): the app that launched a runtime counts as its user, so "used by" no longer depends on catching a connection at the scan instant.
 - **1.0.5** (5 Oct 2026): "used by" keeps an app for a minute after its last connection, so apps that poll their runtime stay attributed between polls.
 - **1.0.4** (2 Oct 2026): the red dot works on Metal-bound generation; the CPU floor behind it was set from a real measurement.
 - **1.0.3**: the busy rule credits the GPU to the candidate with the most CPU activity; a Diagnostics pane in Settings shows what the rule sees.
